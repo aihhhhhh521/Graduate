@@ -63,6 +63,34 @@ def main():
         default=1,
         help="Log step stats every N env steps (default: 1 = every step).",
     )
+    
+    parser.add_argument(
+        "--sampling_strategy",
+        type=str,
+        default=None,
+        help="Optional sampling strategy override passed through to model.config.",
+    )
+
+    parser.add_argument(
+        "--sampling_k",
+        type=int,
+        default=None,
+        help="Optional sampling top-k override passed through to model.config.",
+    )
+
+    parser.add_argument(
+        "--sampling_stride",
+        type=int,
+        default=None,
+        help="Optional sampling stride override passed through to model.config.",
+    )
+
+    parser.add_argument(
+        "--sampling_seed",
+        type=int,
+        default=None,
+        help="Optional sampling seed override passed through to model.config.",
+    )
 
     parser.add_argument(
         "opts",
@@ -85,6 +113,10 @@ def run_exp(
     model_name: str,
     enable_step_stats: bool = False,
     log_every_n_steps: int = 1,
+    sampling_strategy: str = None,
+    sampling_k: int = None,
+    sampling_stride: int = None,
+    sampling_seed: int = None,
     opts=None,
 ) -> None:
     if run_type == "eval":
@@ -110,6 +142,10 @@ def run_exp(
                 split_id=split_id,
                 enable_step_stats=enable_step_stats,
                 log_every_n_steps=log_every_n_steps,
+                sampling_strategy=sampling_strategy,
+                sampling_k=sampling_k,
+                sampling_stride=sampling_stride,
+                sampling_seed=sampling_seed,
             )
         elif model_name == "baseline":
             from evt_bench.default import get_config

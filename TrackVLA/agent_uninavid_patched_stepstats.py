@@ -129,6 +129,10 @@ def evaluate_agent(
     speed_summary_path: Optional[str] = None,
     metrics_summary_path: Optional[str] = None,
     log_every_n_steps: int = 1,
+    sampling_strategy: Optional[str] = None,
+    sampling_k: Optional[int] = None,
+    sampling_stride: Optional[int] = None,
+    sampling_seed: Optional[int] = None,
 ) -> None:
     """
     TrackVLA/EVT-Bench evaluation for Uni-NaVid agent with:
@@ -143,6 +147,30 @@ def evaluate_agent(
           CR = sum(collision) / episode_count
     """
     agent = UniNaVid_Agent(model_path, save_path)
+    
+    # Keep backward-compatible defaults by only overriding values when CLI provided.
+    sampling_config = {
+        "sampling_strategy": (
+            sampling_strategy
+            if sampling_strategy is not None
+            else getattr(agent.model.config, "sampling_strategy", None)
+        ),
+        "sampling_k": (
+            sampling_k if sampling_k is not None else getattr(agent.model.config, "sampling_k", None)
+        ),
+        "sampling_stride": (
+            sampling_stride
+            if sampling_stride is not None
+            else getattr(agent.model.config, "sampling_stride", None)
+        ),
+        "sampling_seed": (
+            sampling_seed
+            if sampling_seed is not None
+            else getattr(agent.model.config, "sampling_seed", None)
+        ),
+    }
+    for key, value in sampling_config.items():
+        setattr(agent.model.config, key, value)
 
     # Default output paths
     if split_id is None:
@@ -383,6 +411,7 @@ def evaluate_agent(
                                 },
                             ),
                             "vis_tokens_total": vis_token_stats.get("vis_tokens_total", None),
+                            "sampling_config": dict(sampling_config),
                         }
                     )
 
@@ -462,6 +491,7 @@ def evaluate_agent(
                             "act_wall": summarize_ms(ep_step_act_wall_ms),
                             "act_cuda": summarize_ms(ep_step_act_cuda_ms),
                         },
+                        "sampling_config": dict(sampling_config),
                     }
                 )
 
@@ -492,6 +522,7 @@ def evaluate_agent(
             "success_rate": (succ_count / episode_count) if episode_count else None,
             "following_rate": (total_following_steps / total_steps_weight) if total_steps_weight else None,
             "collision_rate": (collision_sum / episode_count) if episode_count else None,
+            "sampling_config": dict(sampling_config),
         }
         speed_summary = {
             "step_total_ms": summarize_ms(step_total_ms_all),
