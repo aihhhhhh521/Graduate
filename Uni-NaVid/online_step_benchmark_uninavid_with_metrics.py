@@ -58,6 +58,9 @@ Notes on FPS:
 import os
 import json
 import argparse
+import random
+import subprocess
+from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
 import cv2
@@ -83,6 +86,29 @@ from uninavid.conversation import conv_templates
 os.environ.setdefault("WANDB_MODE", "offline")
 
 ALLOWED_ACTIONS = {"forward", "left", "right", "stop"}
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+def get_git_commit_hash() -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL).decode("utf-8").strip()
+    except Exception:
+        return "unknown"
+
+
+def is_random_strategy(strategy: Optional[str]) -> bool:
+    if not strategy:
+        return False
+    st = str(strategy).lower()
+    return any(k in st for k in ["random", "stochastic", "sample"])
+
 
 
 def load_video_frames(video_path: str, target_fps: float = 1.0, max_frames: Optional[int] = None) -> List[Image.Image]:
@@ -353,6 +379,17 @@ def main():
                         help="e.g. 64. Online historical token budget threshold.")
     parser.add_argument("--online_similarity_threshold", type=float, default=None,
                         help="e.g. 0.985. Similarity threshold for online token merging.")
+                        
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Unified random seed for Python/NumPy/Torch/CUDA.")
+    parser.add_argument("--sampling_strategy", type=str, default=None,
+                        help="Optional sampling strategy override passed to model.config.")
+    parser.add_argument("--sampling_k", type=int, default=None,
+                        help="Optional sampling top-k override passed to model.config.")
+    parser.add_argument("--sampling_stride", type=int, default=None,
+                        help="Optional sampling stride override passed to model.config.")
+    parser.add_argument("--sampling_seed", type=int, default=None,
+                        help="Optional sampling seed override passed to model.config.")
 
     # Generation knobs (online_full)
     parser.add_argument("--conv_mode", type=str, default="vicuna_v1")
@@ -370,6 +407,9 @@ def main():
     parser.add_argument("--tr_dist_max_m", type=float, default=7.5)
 
     args = parser.parse_args()
+    
+    if args.seed is not None:
+        set_global_seed(int(args.seed))
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -394,6 +434,46 @@ def main():
         setattr(model.config, "run_type", "eval")
         
     config_obj = model.config if hasattr(model, "config") else None
+    if config_obj is not None:
+        if args.sampling_strategy is not None:
+            setattr(config_obj, "sampling_strategy", args.sampling_strategy)
+        if args.sampling_k is not None:
+            setattr(config_obj, "sampling_k", int(args.sampling_k))
+        if args.sampling_stride is not None:
+            setattr(config_obj, "sampling_stride", int(args.sampling_stride))
+        if args.sampling_seed is not None:
+            setattr(config_obj, "sampling_seed", int(args.sampling_seed))
+
+    effective_sampling = {
+        "sampling_strategy": getattr(config_obj, "sampling_strategy", None) if config_obj is not None else args.sampling_strategy,
+        "sampling_k": getattr(config_obj, "sampling_k", None) if config_obj is not None else args.sampling_k,
+        "sampling_stride": getattr(config_obj, "sampling_stride", None) if config_obj is not None else args.sampling_stride,
+        "sampling_seed": getattr(config_obj, "sampling_seed", None) if config_obj is not None else args.sampling_seed,
+    }
+    effective_seed = int(args.seed) if args.seed is not None else (
+        int(effective_sampling["sampling_seed"]) if effective_sampling["sampling_seed"] is not None else None
+    )
+    if effective_seed is not None:
+        set_global_seed(effective_seed)
+
+    if is_random_strategy(effective_sampling.get("sampling_strategy")) and args.seed is None and args.sampling_seed is None:
+        print("[WARNING] Detected stochastic sampling strategy but no explicit seed was provided.")
+
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_meta = {
+        "git_commit": get_git_commit_hash(),
+        "model_path": args.model_path,
+        "sampling": effective_sampling,
+        "seed": effective_seed,
+        "split_config": {
+            "data_path": args.data_path,
+            "max_episodes": args.max_episodes,
+            "only_nav_id": args.only_nav_id,
+        },
+        "run_id": run_id,
+    }
+    with open(os.path.join(args.output_dir, "run_meta.json"), "w", encoding="utf-8") as f:
+        json.dump(run_meta, f, ensure_ascii=False, indent=2)
     effective_online_length_threshold = int(getattr(config_obj, "online_length_threshold", 64))
     effective_online_similarity_threshold = float(getattr(config_obj, "online_similarity_threshold", 0.985))
 
@@ -553,6 +633,15 @@ def main():
                 config_obj = model.config if hasattr(model, "config") else None
                 effective_online_length_threshold = int(getattr(config_obj, "online_length_threshold", 64))
                 effective_online_similarity_threshold = float(getattr(config_obj, "online_similarity_threshold", 0.985))
+                record: Dict[str, Any] = {
+                    "run_id": run_id,
+                    "seed": effective_seed,
+                    "strategy": effective_sampling.get("sampling_strategy"),
+                    "sampling_config": dict(effective_sampling),
+                    "episode_id": epi_id,
+                    "step_idx": int(t),
+                    "benchmark_mode": args.benchmark_mode,
+                }
 
                 t_encode_ms = None
                 t_gen_ms = None
@@ -740,6 +829,10 @@ def main():
     # Summary
     # -------------------------
     summary: Dict[str, Any] = {
+        "run_id": run_id,
+        "seed": effective_seed,
+        "strategy": effective_sampling.get("sampling_strategy"),
+        "sampling_config": dict(effective_sampling),
         "n_steps": len(ms_step_all),
         "online_length_threshold": effective_online_length_threshold,
         "online_similarity_threshold": effective_online_similarity_threshold,

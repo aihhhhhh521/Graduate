@@ -1,6 +1,62 @@
 import argparse
 import numpy as np
 import random
+import os
+import json
+import subprocess
+
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+    except Exception:
+        pass
+
+
+def get_git_commit_hash() -> str:
+    try:
+        return (
+            subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL)
+            .decode("utf-8")
+            .strip()
+        )
+    except Exception:
+        return "unknown"
+
+
+def is_random_strategy(strategy: str) -> bool:
+    if not strategy:
+        return False
+    strategy = str(strategy).lower()
+    random_keywords = ["random", "stochastic", "sample"]
+    return any(k in strategy for k in random_keywords)
+
+
+def write_run_meta(
+    save_path: str,
+    model_path: str,
+    split_id: int,
+    split_num: int,
+    sampling_config: dict,
+    seed: int,
+) -> None:
+    os.makedirs(save_path, exist_ok=True)
+    meta = {
+        "git_commit": get_git_commit_hash(),
+        "model_path": model_path,
+        "sampling": sampling_config,
+        "seed": seed,
+        "split_config": {"split_id": split_id, "split_num": split_num},
+    }
+    with open(os.path.join(save_path, "run_meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
 
 
 def main():
@@ -91,6 +147,13 @@ def main():
         default=None,
         help="Optional sampling seed override passed through to model.config.",
     )
+    
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Unified random seed for Python/NumPy/Torch/CUDA.",
+    )
 
     parser.add_argument(
         "opts",
@@ -117,6 +180,7 @@ def run_exp(
     sampling_k: int = None,
     sampling_stride: int = None,
     sampling_seed: int = None,
+    seed: int = None,
     opts=None,
 ) -> None:
     if run_type == "eval":
@@ -126,13 +190,35 @@ def run_exp(
             from agent_uninavid_patched_stepstats import evaluate_agent
 
             config = get_config(exp_config)
-            random.seed(config.habitat.simulator.seed)
-            np.random.seed(config.habitat.simulator.seed)
+            effective_seed = int(seed if seed is not None else config.habitat.simulator.seed)
+            set_global_seed(effective_seed)
 
             dataset = make_dataset(
                 id_dataset=config.habitat.dataset.type, config=config.habitat.dataset
             )
             dataset_split = dataset.get_splits(split_num)[split_id]
+            
+            effective_sampling_seed = sampling_seed if sampling_seed is not None else effective_seed
+            effective_sampling_strategy = sampling_strategy
+            if is_random_strategy(effective_sampling_strategy) and sampling_seed is None and seed is None:
+                print(
+                    "[WARNING] Detected stochastic sampling strategy but no explicit seed was provided; "
+                    "falling back to config.habitat.simulator.seed."
+                )
+
+            write_run_meta(
+                save_path=save_path,
+                model_path=model_path,
+                split_id=split_id,
+                split_num=split_num,
+                sampling_config={
+                    "sampling_strategy": effective_sampling_strategy,
+                    "sampling_k": sampling_k,
+                    "sampling_stride": sampling_stride,
+                    "sampling_seed": effective_sampling_seed,
+                },
+                seed=effective_seed,
+            )
 
             evaluate_agent(
                 config,
@@ -145,7 +231,8 @@ def run_exp(
                 sampling_strategy=sampling_strategy,
                 sampling_k=sampling_k,
                 sampling_stride=sampling_stride,
-                sampling_seed=sampling_seed,
+                sampling_seed=effective_sampling_seed,
+                seed=effective_seed,
             )
         elif model_name == "baseline":
             from evt_bench.default import get_config
@@ -153,8 +240,8 @@ def run_exp(
             from baseline_agent import evaluate_agent
 
             config = get_config(exp_config)
-            random.seed(config.habitat.simulator.seed)
-            np.random.seed(config.habitat.simulator.seed)
+            effective_seed = int(seed if seed is not None else config.habitat.simulator.seed)
+            set_global_seed(effective_seed)
             dataset = make_dataset(
                 id_dataset=config.habitat.dataset.type, config=config.habitat.dataset
             )

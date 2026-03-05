@@ -24,8 +24,33 @@ from habitat.sims.habitat_simulator.actions import HabitatSimActions
 
 import json
 import time
+import subprocess
 from typing import Optional, List
+import random
 from trackvla_step_stats_utils import JSONLWriter, WallTimer, maybe_cuda_timer, hz_from_ms, summarize_ms
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+def get_git_commit_hash() -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL).decode("utf-8").strip()
+    except Exception:
+        return "unknown"
+
+
+def is_random_strategy(strategy: Optional[str]) -> bool:
+    if not strategy:
+        return False
+    st = str(strategy).lower()
+    return any(k in st for k in ["random", "stochastic", "sample"])
+
 
 
 # =========== 定义数据采集 Logger ==========
@@ -133,6 +158,7 @@ def evaluate_agent(
     sampling_k: Optional[int] = None,
     sampling_stride: Optional[int] = None,
     sampling_seed: Optional[int] = None,
+    seed: Optional[int] = None,
 ) -> None:
     """
     TrackVLA/EVT-Bench evaluation for Uni-NaVid agent with:
@@ -171,6 +197,15 @@ def evaluate_agent(
     }
     for key, value in sampling_config.items():
         setattr(agent.model.config, key, value)
+        
+    effective_seed = int(seed) if seed is not None else sampling_config.get("sampling_seed")
+    if effective_seed is not None:
+        set_global_seed(int(effective_seed))
+    if is_random_strategy(sampling_config.get("sampling_strategy")) and seed is None and sampling_seed is None:
+        print("[WARNING] Detected stochastic sampling strategy but no explicit seed was provided.")
+
+    run_id = f"split{split_id if split_id is not None else -1}_{int(time.time())}"
+    strategy_tag = sampling_config.get("sampling_strategy")
 
     # Default output paths
     if split_id is None:
@@ -181,6 +216,21 @@ def evaluate_agent(
         speed_summary_path = os.path.join(save_path, f"speed_summary_split{split_id}.json")
     if enable_step_stats and metrics_summary_path is None:
         metrics_summary_path = os.path.join(save_path, f"metrics_summary_split{split_id}.json")
+        
+    run_meta = {
+        "git_commit": get_git_commit_hash(),
+        "model_path": model_path,
+        "sampling": dict(sampling_config),
+        "seed": effective_seed,
+        "split_config": {
+            "split_id": split_id,
+            "episode_count": len(getattr(dataset_split, "episodes", [])) if hasattr(dataset_split, "episodes") else None,
+        },
+        "run_id": run_id,
+    }
+    os.makedirs(save_path, exist_ok=True)
+    with open(os.path.join(save_path, "run_meta.json"), "w", encoding="utf-8") as f:
+        json.dump(run_meta, f, ensure_ascii=False, indent=2)
 
     writer = JSONLWriter(step_stats_path) if enable_step_stats else None
     cuda_start, cuda_end, cuda_sync_elapsed_ms, cuda_enabled = maybe_cuda_timer()
@@ -412,6 +462,9 @@ def evaluate_agent(
                             ),
                             "vis_tokens_total": vis_token_stats.get("vis_tokens_total", None),
                             "sampling_config": dict(sampling_config),
+                            "run_id": run_id,
+                            "seed": effective_seed,
+                            "strategy": strategy_tag,
                         }
                     )
 
@@ -492,6 +545,9 @@ def evaluate_agent(
                             "act_cuda": summarize_ms(ep_step_act_cuda_ms),
                         },
                         "sampling_config": dict(sampling_config),
+                        "run_id": run_id,
+                        "seed": effective_seed,
+                        "strategy": strategy_tag,
                     }
                 )
 
@@ -523,8 +579,14 @@ def evaluate_agent(
             "following_rate": (total_following_steps / total_steps_weight) if total_steps_weight else None,
             "collision_rate": (collision_sum / episode_count) if episode_count else None,
             "sampling_config": dict(sampling_config),
+            "run_id": run_id,
+            "seed": effective_seed,
+            "strategy": strategy_tag,
         }
         speed_summary = {
+            "run_id": run_id,
+            "seed": effective_seed,
+            "strategy": strategy_tag,
             "step_total_ms": summarize_ms(step_total_ms_all),
             "obs_ms": summarize_ms(step_obs_ms_all),
             "task_obs_ms": summarize_ms(step_taskobs_ms_all),
