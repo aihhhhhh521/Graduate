@@ -325,6 +325,8 @@ class UniNaVIDMetaForCausalLM(ABC):
 
     def vlm_attention(self, image_features, prompts=None, image_counts=None, long_video=False):
         compress_type = self.config.compress_type
+        online_length_threshold = getattr(self.config, "online_length_threshold", 64)
+        online_similarity_threshold = getattr(self.config, "online_similarity_threshold", 0.985)
         compress_grid_sizes = {"grid:2": 4, "grid:4": 16, "mean": 1}
 
         nav_size = compress_grid_sizes.get(compress_type)
@@ -375,7 +377,11 @@ class UniNaVIDMetaForCausalLM(ABC):
                     assert final_token_nav.shape[0] == 1 and final_token_nav.shape[1] == 64 and final_token.shape[0] == 1
 
                     if self.config.run_type == "eval":
-                        final_token, lengths_list = self.online_process_tensor(nav_size)
+                        final_token, lengths_list = self.online_process_tensor(
+                            nav_size,
+                            length_threshold=online_length_threshold,
+                            similarity_threshold=online_similarity_threshold,
+                        )
                     else:
                         final_token, lengths_list = self.process_tensor(final_token, nav_size)
 

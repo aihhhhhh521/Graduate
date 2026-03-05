@@ -392,6 +392,10 @@ def main():
         if args.online_similarity_threshold is not None:
             setattr(model.config, "online_similarity_threshold", float(args.online_similarity_threshold))
         setattr(model.config, "run_type", "eval")
+        
+    config_obj = model.config if hasattr(model, "config") else None
+    effective_online_length_threshold = int(getattr(config_obj, "online_length_threshold", 64))
+    effective_online_similarity_threshold = float(getattr(config_obj, "online_similarity_threshold", 0.985))
 
     # Inner backbone holds caches
     backbone_inner = model.get_model()
@@ -546,7 +550,9 @@ def main():
 
             # --- measured steps
             for t in range(warmup, T):
-                record: Dict[str, Any] = {"episode_id": epi_id, "step_idx": int(t), "video_path": video_path}
+                config_obj = model.config if hasattr(model, "config") else None
+                effective_online_length_threshold = int(getattr(config_obj, "online_length_threshold", 64))
+                effective_online_similarity_threshold = float(getattr(config_obj, "online_similarity_threshold", 0.985))
 
                 t_encode_ms = None
                 t_gen_ms = None
@@ -735,6 +741,8 @@ def main():
     # -------------------------
     summary: Dict[str, Any] = {
         "n_steps": len(ms_step_all),
+        "online_length_threshold": effective_online_length_threshold,
+        "online_similarity_threshold": effective_online_similarity_threshold,
         "ms_step_mean": float(np.mean(ms_step_all)) if ms_step_all else float("nan"),
         **{f"ms_step_{k}": v for k, v in percentiles(ms_step_all).items()},
         "hz_mean": float(np.mean(hz_all)) if hz_all else float("nan"),

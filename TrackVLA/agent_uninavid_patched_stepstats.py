@@ -176,6 +176,45 @@ def evaluate_agent(
     step_act_cuda_ms_all: List[float] = []
     step_env_ms_all: List[float] = []
     step_getm_ms_all: List[float] = []
+    step_vis_tokens_all: List[float] = []
+    step_vis_nav_tokens_all: List[float] = []
+    step_vis_total_visual_tokens_all: List[float] = []
+
+    def _get_latest_visual_token_stats() -> dict:
+        """Read latest visual-token runtime stats from model (if available)."""
+        runtime_holder = None
+        if hasattr(agent, "model"):
+            runtime_holder = agent.model
+            if not hasattr(runtime_holder, "get_runtime_stats") and hasattr(runtime_holder, "get_model"):
+                try:
+                    runtime_holder = runtime_holder.get_model()
+                except Exception:
+                    runtime_holder = None
+
+        if runtime_holder is None or not hasattr(runtime_holder, "get_runtime_stats"):
+            return {}
+
+        try:
+            stats = runtime_holder.get_runtime_stats() or {}
+        except Exception:
+            return {}
+
+        steps = stats.get("vis_tokens_llm_steps", [])
+        structs = stats.get("vis_tokens_llm_structure", [])
+        step_latest = steps[-1] if steps else None
+        struct_latest = structs[-1] if structs else {}
+        if not isinstance(struct_latest, dict):
+            struct_latest = {}
+
+        return {
+            "vis_tokens_step": int(step_latest) if step_latest is not None else None,
+            "vis_tokens_total": stats.get("vis_tokens_llm_total", None),
+            "vis_structure_step": {
+                "history_blocks": struct_latest.get("history_blocks", []),
+                "nav_tokens": struct_latest.get("nav_tokens", None),
+                "total_visual_tokens": struct_latest.get("total_visual_tokens", None),
+            },
+        }
 
     with habitat.TrackEnv(config=config, dataset=dataset_split) as env:
         sim = env.sim
@@ -238,6 +277,7 @@ def evaluate_agent(
                 if cuda_enabled and cuda_start is not None and cuda_end is not None and cuda_sync_elapsed_ms is not None:
                     cuda_start()
                 action = agent.act(obs, info, instruction, env.current_episode.episode_id)
+                vis_token_stats = _get_latest_visual_token_stats() if enable_step_stats else {}
                 if cuda_enabled and cuda_start is not None and cuda_end is not None and cuda_sync_elapsed_ms is not None:
                     cuda_end()
                     try:
@@ -333,6 +373,16 @@ def evaluate_agent(
                                 "dis_to_human": dis_to_human,
                                 "too_far_count": too_far_count,
                             },
+                            "vis_tokens_step": vis_token_stats.get("vis_tokens_step", None),
+                            "vis_structure_step": vis_token_stats.get(
+                                "vis_structure_step",
+                                {
+                                    "history_blocks": [],
+                                    "nav_tokens": None,
+                                    "total_visual_tokens": None,
+                                },
+                            ),
+                            "vis_tokens_total": vis_token_stats.get("vis_tokens_total", None),
                         }
                     )
 
@@ -345,6 +395,19 @@ def evaluate_agent(
                     step_act_cuda_ms_all.append(act_cuda_ms)
                 step_env_ms_all.append(env_ms)
                 step_getm_ms_all.append(getm_ms)
+                if enable_step_stats:
+                    vis_step = vis_token_stats.get("vis_tokens_step", None)
+                    if vis_step is not None:
+                        step_vis_tokens_all.append(float(vis_step))
+
+                    vis_struct = vis_token_stats.get("vis_structure_step", {})
+                    if isinstance(vis_struct, dict):
+                        nav_tokens = vis_struct.get("nav_tokens", None)
+                        total_visual_tokens = vis_struct.get("total_visual_tokens", None)
+                        if nav_tokens is not None:
+                            step_vis_nav_tokens_all.append(float(nav_tokens))
+                        if total_visual_tokens is not None:
+                            step_vis_total_visual_tokens_all.append(float(total_visual_tokens))
 
                 ep_step_total_ms.append(total_ms)
                 ep_step_act_wall_ms.append(act_wall_ms)
@@ -438,6 +501,9 @@ def evaluate_agent(
             "act_cuda_ms": summarize_ms(step_act_cuda_ms_all),
             "env_step_ms": summarize_ms(step_env_ms_all),
             "get_metrics_ms": summarize_ms(step_getm_ms_all),
+            "vis_tokens_step": summarize_ms(step_vis_tokens_all),
+            "vis_structure_step_nav_tokens": summarize_ms(step_vis_nav_tokens_all),
+            "vis_structure_step_total_visual_tokens": summarize_ms(step_vis_total_visual_tokens_all),
             "approx_hz_mean": hz_from_ms(speed_summary_path and summarize_ms(step_total_ms_all).get("mean") or 0.0),
         }
 
