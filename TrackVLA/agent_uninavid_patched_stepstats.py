@@ -159,6 +159,7 @@ def evaluate_agent(
     sampling_stride: Optional[int] = None,
     sampling_seed: Optional[int] = None,
     seed: Optional[int] = None,
+    token_ablation_mode: Optional[str] = None,
 ) -> None:
     """
     TrackVLA/EVT-Bench evaluation for Uni-NaVid agent with:
@@ -194,7 +195,19 @@ def evaluate_agent(
             if sampling_seed is not None
             else getattr(agent.model.config, "sampling_seed", None)
         ),
+        "token_ablation_mode": (
+            token_ablation_mode
+            if token_ablation_mode is not None
+            else getattr(agent.model.config, "token_ablation_mode", None)
+        ),
     }
+    # In ablation mode, explicitly disable legacy sampling switches.
+    if sampling_config.get("token_ablation_mode"):
+        sampling_config["sampling_strategy"] = None
+        sampling_config["sampling_k"] = None
+        sampling_config["sampling_stride"] = None
+        sampling_config["sampling_seed"] = None
+
     for key, value in sampling_config.items():
         setattr(agent.model.config, key, value)
         

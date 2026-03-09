@@ -193,6 +193,9 @@ class UniNaVIDMetaForCausalLM(ABC):
         }
         
     def _get_sampling_strategy(self):
+        # Token-ablation experiments are mutually exclusive with legacy sampling.
+        if getattr(self.config, "token_ablation_mode", None):
+            return None
         strategy = getattr(self.config, "sampling_strategy", None)
         if strategy:
             return strategy
@@ -200,6 +203,80 @@ class UniNaVIDMetaForCausalLM(ABC):
         if isinstance(compress_type, str) and compress_type.startswith(("random:", "stride:", "topk_score:")):
             return compress_type
         return None
+
+    def _get_token_ablation_mode(self):
+        mode = getattr(self.config, "token_ablation_mode", None)
+        if mode is None:
+            return None
+        mode = str(mode).strip().lower()
+        if mode in ("", "none"):
+            return None
+        valid_modes = {"pool_all_2x2_to_1x1", "drop_history_keep_latest_nav64"}
+        if mode not in valid_modes:
+            raise ValueError(
+                f"Unsupported token_ablation_mode: {mode}. Valid modes: {sorted(valid_modes)}"
+            )
+        return mode
+
+    def _apply_history_token_ablation(self, result_tensor, result_list):
+        """Apply dedicated history-token ablations for current experiments.
+
+        - pool_all_2x2_to_1x1: pool every history block (>1 tokens) to 1 token.
+        - drop_history_keep_latest_nav64: remove all history tokens; keep nav 8x8
+          tokens untouched (they are appended separately as final_token_nav).
+        """
+        mode = self._get_token_ablation_mode()
+        if mode is None:
+            return result_tensor, result_list
+
+        input_is_batched = False
+        if result_tensor.dim() == 3:
+            if result_tensor.shape[0] != 1:
+                raise ValueError(
+                    f"Expected batch size 1 for history tensor [1, T, C], got {tuple(result_tensor.shape)}"
+                )
+            input_is_batched = True
+            result_tensor_2d = result_tensor.squeeze(0)
+        elif result_tensor.dim() == 2:
+            result_tensor_2d = result_tensor
+        else:
+            raise ValueError(f"Expected history tensor [T, C] or [1, T, C], got {tuple(result_tensor.shape)}")
+
+        if mode == "drop_history_keep_latest_nav64":
+            out = result_tensor_2d.new_zeros((0, result_tensor_2d.shape[-1]))
+            return (out.unsqueeze(0) if input_is_batched else out), []
+
+        # mode == pool_all_2x2_to_1x1
+        if not result_list:
+            return result_tensor, result_list
+
+        pooled_blocks = []
+        new_result_list = []
+        cursor = 0
+        for block_len in result_list:
+            L = int(block_len)
+            if L <= 0:
+                continue
+            block = result_tensor_2d[cursor:cursor + L]
+            cursor += L
+            if block.shape[0] != L:
+                raise ValueError(
+                    f"History block length mismatch, expect={L}, got={block.shape[0]}"
+                )
+            pooled_blocks.append(block if L == 1 else block.mean(dim=0, keepdim=True))
+            new_result_list.append(1)
+
+        if cursor != result_tensor_2d.shape[0]:
+            raise ValueError(
+                f"History token accounting mismatch: used={cursor}, total={result_tensor_2d.shape[0]}"
+            )
+
+        if not pooled_blocks:
+            out = result_tensor_2d.new_zeros((0, result_tensor_2d.shape[-1]))
+            return (out.unsqueeze(0) if input_is_batched else out), []
+
+        out = torch.cat(pooled_blocks, dim=0)
+        return (out.unsqueeze(0) if input_is_batched else out), new_result_list
 
     def apply_token_sampling_strategy(self, tensor, strategy, nav_size=None, keep_background=False):
         if not strategy:
@@ -278,14 +355,14 @@ class UniNaVIDMetaForCausalLM(ABC):
                 nav_size=nav_size,
                 keep_background=getattr(self.config, "sampling_keep_background", False),
             )
-            return sampled_tensor.squeeze(0), result_list
+            return self._apply_history_token_ablation(sampled_tensor.squeeze(0), result_list)
         assert m % nav_size == 0, f"m ({m}) must be divisible by nav_size ({nav_size})"
         result_list = []
         
         
         if k <= length_threshold:
             result_list = [nav_size] * k
-            return self.get_model().feat_cache.reshape(-1, c), result_list
+            return self._apply_history_token_ablation(self.get_model().feat_cache.reshape(-1, c), result_list)
 
         
         cos = torch.nn.CosineSimilarity(dim=0)
@@ -326,7 +403,7 @@ class UniNaVIDMetaForCausalLM(ABC):
 
 
 
-        return result_tensor, result_list
+        return self._apply_history_token_ablation(result_tensor, result_list)
 
 
 
@@ -336,12 +413,13 @@ class UniNaVIDMetaForCausalLM(ABC):
         sampling_strategy = self._get_sampling_strategy()
 
         if sampling_strategy is not None:
-            return self.apply_token_sampling_strategy(
+            sampled_tensor, result_list = self.apply_token_sampling_strategy(
                 tensor,
                 sampling_strategy,
                 nav_size=nav_size,
                 keep_background=getattr(self.config, "sampling_keep_background", False),
             )
+            return self._apply_history_token_ablation(sampled_tensor, result_list)
 
         if m % nav_size != 0:
             raise ValueError("m must be divisible by nav_size")
@@ -350,7 +428,7 @@ class UniNaVIDMetaForCausalLM(ABC):
 
         if k <= length_threshold:
             result_list = [nav_size] * k
-            return tensor, result_list
+            return self._apply_history_token_ablation(tensor, result_list)
 
         elif k == length_threshold + 1:
             split_tensors = tensor.view(n, k, nav_size, t)
@@ -358,7 +436,7 @@ class UniNaVIDMetaForCausalLM(ABC):
             remaining_tensors = split_tensors[:, k - length_threshold:, :, :].reshape(n, -1, t)
             result_tensor = torch.cat([means, remaining_tensors], dim=1)
             result_list = [1] + [nav_size] * length_threshold
-            return result_tensor, result_list
+            return self._apply_history_token_ablation(result_tensor, result_list)
 
         split_tensors = tensor.view(n, k, nav_size, t)
 
@@ -395,7 +473,7 @@ class UniNaVIDMetaForCausalLM(ABC):
 
         assert result_tensor.shape[1] == sum(result_list), "The sum of the list does not match the tensor dimension"
 
-        return result_tensor, result_list
+        return self._apply_history_token_ablation(result_tensor, result_list)
 
 
 

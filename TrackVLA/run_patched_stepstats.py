@@ -156,6 +156,18 @@ def main():
     )
 
     parser.add_argument(
+        "--token-ablation-mode",
+        type=str,
+        default=None,
+        choices=["pool_all_2x2_to_1x1", "drop_history_keep_latest_nav64"],
+        help=(
+            "Token-ablation experiment mode. "
+            "pool_all_2x2_to_1x1: pool every history 2x2 block to 1x1; "
+            "drop_history_keep_latest_nav64: drop all history tokens and keep latest 8x8 nav tokens only."
+        ),
+    )
+
+    parser.add_argument(
         "opts",
         default=None,
         nargs=argparse.REMAINDER,
@@ -181,6 +193,7 @@ def run_exp(
     sampling_stride: int = None,
     sampling_seed: int = None,
     seed: int = None,
+    token_ablation_mode: str = None,
     opts=None,
 ) -> None:
     if run_type == "eval":
@@ -216,6 +229,7 @@ def run_exp(
                     "sampling_k": sampling_k,
                     "sampling_stride": sampling_stride,
                     "sampling_seed": effective_sampling_seed,
+                    "token_ablation_mode": token_ablation_mode,
                 },
                 seed=effective_seed,
             )
@@ -233,6 +247,7 @@ def run_exp(
                 sampling_stride=sampling_stride,
                 sampling_seed=effective_sampling_seed,
                 seed=effective_seed,
+                token_ablation_mode=token_ablation_mode,
             )
         elif model_name == "baseline":
             from evt_bench.default import get_config
