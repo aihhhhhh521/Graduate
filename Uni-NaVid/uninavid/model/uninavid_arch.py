@@ -119,9 +119,9 @@ class UniNaVIDMetaForCausalLM(ABC):
         # Per-step detailed visual-token structure: list of dicts
         #   {"history_blocks": [int, ...], "nav_tokens": int, "total_visual_tokens": int}
         self.vis_tokens_llm_structure = []
-        self.vis_tokens_sampling_strategy = getattr(self.config, "sampling_strategy", None)
+        self.vis_tokens_llm_structure_attach_idx = 0
 
-    def _update_visual_token_stats(self, lengths_list, nav_token_count=0, sampling_strategy=None):
+    def _update_visual_token_stats(self, lengths_list, nav_token_count=0):
         """Update runtime statistics for *LLM input* visual tokens.
 
         lengths_list: list of ints from online_process_tensor/process_tensor,
@@ -176,9 +176,39 @@ class UniNaVIDMetaForCausalLM(ABC):
                     "history_blocks": history_blocks,
                     "nav_tokens": int(nav_token_count),
                     "total_visual_tokens": int(total_vis_tokens),
-                    "sampling_strategy": sampling_strategy,
+                    "token_ablation_mode": self._get_token_ablation_mode(),
                 }
             )
+
+    def _attach_llm_input_token_structure(self, total_llm_input_tokens: int):
+        if not hasattr(self, "vis_tokens_llm_structure"):
+            return
+        idx = int(getattr(self, "vis_tokens_llm_structure_attach_idx", 0))
+        if idx >= len(self.vis_tokens_llm_structure):
+            return
+        node = self.vis_tokens_llm_structure[idx]
+        history_blocks = list(node.get("history_blocks", [])) if isinstance(node, dict) else []
+        nav_tokens = int(node.get("nav_tokens", 0)) if isinstance(node, dict) else 0
+        visual_total = int(node.get("total_visual_tokens", 0)) if isinstance(node, dict) else 0
+        text_tokens = max(int(total_llm_input_tokens) - visual_total, 0)
+
+        structure_lines = ["<|vision_bos|>"]
+        for blk in history_blocks:
+            structure_lines.append(f"├─ VIDEO_HIST × {int(blk)}")
+        structure_lines.extend(
+            [
+                f"├─ VIDEO_NAV × {nav_tokens}",
+                "<|vision_eos|>",
+                "<|text_semantic|>",
+                f"├─ TEXT × {text_tokens}",
+                "<|text_eos|>",
+            ]
+        )
+
+        node["llm_input_total_tokens"] = int(total_llm_input_tokens)
+        node["llm_text_tokens"] = int(text_tokens)
+        node["llm_input_structure"] = structure_lines
+        self.vis_tokens_llm_structure_attach_idx = idx + 1
 
     def get_runtime_stats(self):
         """Return a dict of accumulated visual-token statistics."""
@@ -189,20 +219,7 @@ class UniNaVIDMetaForCausalLM(ABC):
             "vis_tokens_llm_total": int(self.vis_tokens_llm_total),
             "vis_tokens_llm_buckets": dict(self.vis_tokens_llm_buckets),
             "vis_tokens_llm_structure": list(getattr(self, "vis_tokens_llm_structure", [])),
-            "sampling_strategy": getattr(self, "vis_tokens_sampling_strategy", None),
         }
-        
-    def _get_sampling_strategy(self):
-        # Token-ablation experiments are mutually exclusive with legacy sampling.
-        if getattr(self.config, "token_ablation_mode", None):
-            return None
-        strategy = getattr(self.config, "sampling_strategy", None)
-        if strategy:
-            return strategy
-        compress_type = getattr(self.config, "compress_type", None)
-        if isinstance(compress_type, str) and compress_type.startswith(("random:", "stride:", "topk_score:")):
-            return compress_type
-        return None
 
     def _get_token_ablation_mode(self):
         mode = getattr(self.config, "token_ablation_mode", None)
@@ -278,84 +295,9 @@ class UniNaVIDMetaForCausalLM(ABC):
         out = torch.cat(pooled_blocks, dim=0)
         return (out.unsqueeze(0) if input_is_batched else out), new_result_list
 
-    def apply_token_sampling_strategy(self, tensor, strategy, nav_size=None, keep_background=False):
-        if not strategy:
-            k = tensor.shape[1] // nav_size if nav_size else tensor.shape[1]
-            return tensor, [nav_size] * k if nav_size else [tensor.shape[1]]
-
-        if tensor.dim() != 3:
-            raise ValueError(f"Expected tensor [N, M, C], got {tuple(tensor.shape)}")
-
-        n, m, c = tensor.shape
-        if nav_size is None:
-            nav_size = m
-        if m % nav_size != 0:
-            raise ValueError(f"m ({m}) must be divisible by nav_size ({nav_size})")
-
-        k = m // nav_size
-        split_tensors = tensor.view(n, k, nav_size, c)
-        prefix, payload = strategy.split(":", 1)
-        sampled_frames = []
-        result_list = []
-
-        for frame_idx in range(k):
-            frame_tokens = split_tensors[:, frame_idx, :, :]
-
-            if prefix == "random":
-                sample_k = int(payload.split("k=")[-1])
-                sample_k = max(1, min(sample_k, nav_size))
-                perm = torch.randperm(nav_size, device=frame_tokens.device)[:sample_k]
-                sampled = frame_tokens[:, perm, :]
-            elif prefix == "stride":
-                stride = int(payload.split("s=")[-1])
-                if stride <= 0:
-                    raise ValueError(f"stride must be > 0, got {stride}")
-                sampled = frame_tokens[:, ::stride, :]
-            elif prefix == "topk_score":
-                sample_k = int(payload.split("k=")[-1])
-                sample_k = max(1, min(sample_k, nav_size))
-                if hasattr(self.get_model(), "track_token_gater") and hasattr(self.get_model().track_token_gater, "score_mlp"):
-                    scores = self.get_model().track_token_gater.score_mlp(frame_tokens).squeeze(-1)
-                elif hasattr(self.get_model(), "token_gater") and hasattr(self.get_model().token_gater, "mlp"):
-                    scores = self.get_model().token_gater.mlp(frame_tokens).squeeze(-1)
-                else:
-                    scores = frame_tokens.norm(dim=-1)
-                topk_idx = torch.topk(scores, k=sample_k, dim=1, largest=True).indices
-                gather_idx = topk_idx.unsqueeze(-1).expand(-1, -1, c)
-                sampled = torch.gather(frame_tokens, dim=1, index=gather_idx)
-            else:
-                raise ValueError(f"Unsupported sampling strategy: {strategy}")
-
-            if keep_background and sampled.shape[1] < nav_size:
-                mask = torch.ones((n, nav_size), device=frame_tokens.device, dtype=torch.bool)
-                if prefix == "stride":
-                    used = torch.arange(0, nav_size, int(payload.split("s=")[-1]), device=frame_tokens.device)
-                    mask[:, used] = False
-                else:
-                    mask.scatter_(1, topk_idx if prefix == "topk_score" else perm.unsqueeze(0).expand(n, -1), False)
-                bg_count = mask.sum(dim=1, keepdim=True).clamp(min=1)
-                bg = (frame_tokens * mask.unsqueeze(-1)).sum(dim=1, keepdim=True) / bg_count.unsqueeze(-1)
-                sampled = torch.cat([sampled, bg], dim=1)
-
-            sampled_frames.append(sampled)
-            result_list.append(int(sampled.shape[1]))
-
-        result_tensor = torch.cat(sampled_frames, dim=1)
-        assert result_tensor.shape[1] == sum(result_list), "The sum of the list does not match the tensor dimension"
-        return result_tensor, result_list
-
     def online_process_tensor(self, nav_size, length_threshold=64, similarity_threshold=0.985):
         k, m, c = self.get_model().feat_cache.shape
-        sampling_strategy = self._get_sampling_strategy()
 
-        if sampling_strategy is not None:
-            sampled_tensor, result_list = self.apply_token_sampling_strategy(
-                self.get_model().feat_cache.reshape(1, -1, c),
-                sampling_strategy,
-                nav_size=nav_size,
-                keep_background=getattr(self.config, "sampling_keep_background", False),
-            )
-            return self._apply_history_token_ablation(sampled_tensor.squeeze(0), result_list)
         assert m % nav_size == 0, f"m ({m}) must be divisible by nav_size ({nav_size})"
         result_list = []
         
@@ -410,16 +352,6 @@ class UniNaVIDMetaForCausalLM(ABC):
 
     def process_tensor(self, tensor, nav_size, length_threshold=64, similarity_threshold=0.985):
         n, m, t = tensor.shape
-        sampling_strategy = self._get_sampling_strategy()
-
-        if sampling_strategy is not None:
-            sampled_tensor, result_list = self.apply_token_sampling_strategy(
-                tensor,
-                sampling_strategy,
-                nav_size=nav_size,
-                keep_background=getattr(self.config, "sampling_keep_background", False),
-            )
-            return self._apply_history_token_ablation(sampled_tensor, result_list)
 
         if m % nav_size != 0:
             raise ValueError("m must be divisible by nav_size")
@@ -564,7 +496,6 @@ class UniNaVIDMetaForCausalLM(ABC):
                         self._update_visual_token_stats(
                             lengths_list,
                             nav_token_count=nav_token_count,
-                            sampling_strategy=self._get_sampling_strategy(),
                         )
 
                     if self.config.run_type == "eval":
@@ -582,7 +513,6 @@ class UniNaVIDMetaForCausalLM(ABC):
                         self._update_visual_token_stats(
                             lengths_list,
                             nav_token_count=0,
-                            sampling_strategy=self._get_sampling_strategy(),
                         )
 
                     video_or_not.append(True)
@@ -883,6 +813,10 @@ class UniNaVIDMetaForCausalLM(ABC):
                         cur_new_labels.append(cur_labels)
                 cur_new_input_embeds = [x.to(device=self.device) for x in cur_new_input_embeds]
                 cur_new_input_embeds = torch.cat(cur_new_input_embeds, dim=0)
+
+                if hasattr(self, "_attach_llm_input_token_structure"):
+                    self._attach_llm_input_token_structure(int(cur_new_input_embeds.shape[0]))
+
                 new_input_embeds.append(cur_new_input_embeds)
                 if labels is not None:
                     cur_new_labels = torch.cat(cur_new_labels, dim=0)

@@ -45,14 +45,6 @@ def get_git_commit_hash() -> str:
         return "unknown"
 
 
-def is_random_strategy(strategy: Optional[str]) -> bool:
-    if not strategy:
-        return False
-    st = str(strategy).lower()
-    return any(k in st for k in ["random", "stochastic", "sample"])
-
-
-
 # =========== 定义数据采集 Logger ==========
 class TrackDatasetLogger:
     """
@@ -154,10 +146,6 @@ def evaluate_agent(
     speed_summary_path: Optional[str] = None,
     metrics_summary_path: Optional[str] = None,
     log_every_n_steps: int = 1,
-    sampling_strategy: Optional[str] = None,
-    sampling_k: Optional[int] = None,
-    sampling_stride: Optional[int] = None,
-    sampling_seed: Optional[int] = None,
     seed: Optional[int] = None,
     token_ablation_mode: Optional[str] = None,
 ) -> None:
@@ -174,51 +162,24 @@ def evaluate_agent(
           CR = sum(collision) / episode_count
     """
     agent = UniNaVid_Agent(model_path, save_path)
-    
-    # Keep backward-compatible defaults by only overriding values when CLI provided.
-    sampling_config = {
-        "sampling_strategy": (
-            sampling_strategy
-            if sampling_strategy is not None
-            else getattr(agent.model.config, "sampling_strategy", None)
-        ),
-        "sampling_k": (
-            sampling_k if sampling_k is not None else getattr(agent.model.config, "sampling_k", None)
-        ),
-        "sampling_stride": (
-            sampling_stride
-            if sampling_stride is not None
-            else getattr(agent.model.config, "sampling_stride", None)
-        ),
-        "sampling_seed": (
-            sampling_seed
-            if sampling_seed is not None
-            else getattr(agent.model.config, "sampling_seed", None)
-        ),
+
+    ablation_config = {
         "token_ablation_mode": (
             token_ablation_mode
             if token_ablation_mode is not None
             else getattr(agent.model.config, "token_ablation_mode", None)
         ),
     }
-    # In ablation mode, explicitly disable legacy sampling switches.
-    if sampling_config.get("token_ablation_mode"):
-        sampling_config["sampling_strategy"] = None
-        sampling_config["sampling_k"] = None
-        sampling_config["sampling_stride"] = None
-        sampling_config["sampling_seed"] = None
 
-    for key, value in sampling_config.items():
+    for key, value in ablation_config.items():
         setattr(agent.model.config, key, value)
         
-    effective_seed = int(seed) if seed is not None else sampling_config.get("sampling_seed")
+    effective_seed = int(seed) if seed is not None else getattr(config.habitat.simulator, "seed", None)
     if effective_seed is not None:
         set_global_seed(int(effective_seed))
-    if is_random_strategy(sampling_config.get("sampling_strategy")) and seed is None and sampling_seed is None:
-        print("[WARNING] Detected stochastic sampling strategy but no explicit seed was provided.")
 
     run_id = f"split{split_id if split_id is not None else -1}_{int(time.time())}"
-    strategy_tag = sampling_config.get("sampling_strategy")
+    strategy_tag = ablation_config.get("token_ablation_mode")
 
     # Default output paths
     if split_id is None:
@@ -233,7 +194,7 @@ def evaluate_agent(
     run_meta = {
         "git_commit": get_git_commit_hash(),
         "model_path": model_path,
-        "sampling": dict(sampling_config),
+        "token_ablation": dict(ablation_config),
         "seed": effective_seed,
         "split_config": {
             "split_id": split_id,
@@ -270,6 +231,8 @@ def evaluate_agent(
     step_vis_tokens_all: List[float] = []
     step_vis_nav_tokens_all: List[float] = []
     step_vis_total_visual_tokens_all: List[float] = []
+    step_llm_input_total_tokens_all: List[float] = []
+    step_llm_text_tokens_all: List[float] = []
 
     def _get_latest_visual_token_stats() -> dict:
         """Read latest visual-token runtime stats from model (if available)."""
@@ -304,6 +267,9 @@ def evaluate_agent(
                 "history_blocks": struct_latest.get("history_blocks", []),
                 "nav_tokens": struct_latest.get("nav_tokens", None),
                 "total_visual_tokens": struct_latest.get("total_visual_tokens", None),
+                "llm_input_total_tokens": struct_latest.get("llm_input_total_tokens", None),
+                "llm_text_tokens": struct_latest.get("llm_text_tokens", None),
+                "llm_input_structure": struct_latest.get("llm_input_structure", None),
             },
         }
 
@@ -474,7 +440,7 @@ def evaluate_agent(
                                 },
                             ),
                             "vis_tokens_total": vis_token_stats.get("vis_tokens_total", None),
-                            "sampling_config": dict(sampling_config),
+                            "token_ablation_config": dict(ablation_config),
                             "run_id": run_id,
                             "seed": effective_seed,
                             "strategy": strategy_tag,
@@ -503,6 +469,12 @@ def evaluate_agent(
                             step_vis_nav_tokens_all.append(float(nav_tokens))
                         if total_visual_tokens is not None:
                             step_vis_total_visual_tokens_all.append(float(total_visual_tokens))
+                        llm_total_tokens = vis_struct.get("llm_input_total_tokens", None)
+                        llm_text_tokens = vis_struct.get("llm_text_tokens", None)
+                        if llm_total_tokens is not None:
+                            step_llm_input_total_tokens_all.append(float(llm_total_tokens))
+                        if llm_text_tokens is not None:
+                            step_llm_text_tokens_all.append(float(llm_text_tokens))
 
                 ep_step_total_ms.append(total_ms)
                 ep_step_act_wall_ms.append(act_wall_ms)
@@ -557,7 +529,7 @@ def evaluate_agent(
                             "act_wall": summarize_ms(ep_step_act_wall_ms),
                             "act_cuda": summarize_ms(ep_step_act_cuda_ms),
                         },
-                        "sampling_config": dict(sampling_config),
+                        "token_ablation_config": dict(ablation_config),
                         "run_id": run_id,
                         "seed": effective_seed,
                         "strategy": strategy_tag,
@@ -591,7 +563,7 @@ def evaluate_agent(
             "success_rate": (succ_count / episode_count) if episode_count else None,
             "following_rate": (total_following_steps / total_steps_weight) if total_steps_weight else None,
             "collision_rate": (collision_sum / episode_count) if episode_count else None,
-            "sampling_config": dict(sampling_config),
+            "token_ablation_config": dict(ablation_config),
             "run_id": run_id,
             "seed": effective_seed,
             "strategy": strategy_tag,
@@ -610,6 +582,8 @@ def evaluate_agent(
             "vis_tokens_step": summarize_ms(step_vis_tokens_all),
             "vis_structure_step_nav_tokens": summarize_ms(step_vis_nav_tokens_all),
             "vis_structure_step_total_visual_tokens": summarize_ms(step_vis_total_visual_tokens_all),
+            "llm_input_total_tokens": summarize_ms(step_llm_input_total_tokens_all),
+            "llm_text_tokens": summarize_ms(step_llm_text_tokens_all),
             "approx_hz_mean": hz_from_ms(speed_summary_path and summarize_ms(step_total_ms_all).get("mean") or 0.0),
         }
 

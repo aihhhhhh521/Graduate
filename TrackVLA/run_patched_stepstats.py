@@ -31,27 +31,19 @@ def get_git_commit_hash() -> str:
         return "unknown"
 
 
-def is_random_strategy(strategy: str) -> bool:
-    if not strategy:
-        return False
-    strategy = str(strategy).lower()
-    random_keywords = ["random", "stochastic", "sample"]
-    return any(k in strategy for k in random_keywords)
-
-
 def write_run_meta(
     save_path: str,
     model_path: str,
     split_id: int,
     split_num: int,
-    sampling_config: dict,
+    ablation_config: dict,
     seed: int,
 ) -> None:
     os.makedirs(save_path, exist_ok=True)
     meta = {
         "git_commit": get_git_commit_hash(),
         "model_path": model_path,
-        "sampling": sampling_config,
+        "token_ablation": ablation_config,
         "seed": seed,
         "split_config": {"split_id": split_id, "split_num": split_num},
     }
@@ -121,34 +113,6 @@ def main():
     )
     
     parser.add_argument(
-        "--sampling_strategy",
-        type=str,
-        default=None,
-        help="Optional sampling strategy override passed through to model.config.",
-    )
-
-    parser.add_argument(
-        "--sampling_k",
-        type=int,
-        default=None,
-        help="Optional sampling top-k override passed through to model.config.",
-    )
-
-    parser.add_argument(
-        "--sampling_stride",
-        type=int,
-        default=None,
-        help="Optional sampling stride override passed through to model.config.",
-    )
-
-    parser.add_argument(
-        "--sampling_seed",
-        type=int,
-        default=None,
-        help="Optional sampling seed override passed through to model.config.",
-    )
-    
-    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -188,10 +152,6 @@ def run_exp(
     model_name: str,
     enable_step_stats: bool = False,
     log_every_n_steps: int = 1,
-    sampling_strategy: str = None,
-    sampling_k: int = None,
-    sampling_stride: int = None,
-    sampling_seed: int = None,
     seed: int = None,
     token_ablation_mode: str = None,
     opts=None,
@@ -210,25 +170,13 @@ def run_exp(
                 id_dataset=config.habitat.dataset.type, config=config.habitat.dataset
             )
             dataset_split = dataset.get_splits(split_num)[split_id]
-            
-            effective_sampling_seed = sampling_seed if sampling_seed is not None else effective_seed
-            effective_sampling_strategy = sampling_strategy
-            if is_random_strategy(effective_sampling_strategy) and sampling_seed is None and seed is None:
-                print(
-                    "[WARNING] Detected stochastic sampling strategy but no explicit seed was provided; "
-                    "falling back to config.habitat.simulator.seed."
-                )
 
             write_run_meta(
                 save_path=save_path,
                 model_path=model_path,
                 split_id=split_id,
                 split_num=split_num,
-                sampling_config={
-                    "sampling_strategy": effective_sampling_strategy,
-                    "sampling_k": sampling_k,
-                    "sampling_stride": sampling_stride,
-                    "sampling_seed": effective_sampling_seed,
+                ablation_config={
                     "token_ablation_mode": token_ablation_mode,
                 },
                 seed=effective_seed,
@@ -242,10 +190,6 @@ def run_exp(
                 split_id=split_id,
                 enable_step_stats=enable_step_stats,
                 log_every_n_steps=log_every_n_steps,
-                sampling_strategy=sampling_strategy,
-                sampling_k=sampling_k,
-                sampling_stride=sampling_stride,
-                sampling_seed=effective_sampling_seed,
                 seed=effective_seed,
                 token_ablation_mode=token_ablation_mode,
             )
