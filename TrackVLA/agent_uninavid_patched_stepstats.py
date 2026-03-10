@@ -172,8 +172,18 @@ def evaluate_agent(
     }
 
     for key, value in ablation_config.items():
+        # Keep both top-level and inner model configs in sync.
+        # Some Uni-NaVid code paths read `self.config`, while others may
+        # access `self.get_model().config` directly.
         setattr(agent.model.config, key, value)
-        
+        if hasattr(agent.model, "get_model"):
+            try:
+                inner_model = agent.model.get_model()
+            except Exception:
+                inner_model = None
+            if inner_model is not None and hasattr(inner_model, "config"):
+                setattr(inner_model.config, key, value)
+
     effective_seed = int(seed) if seed is not None else getattr(config.habitat.simulator, "seed", None)
     if effective_seed is not None:
         set_global_seed(int(effective_seed))

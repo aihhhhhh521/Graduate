@@ -238,7 +238,7 @@ class UniNaVIDMetaForCausalLM(ABC):
     def _apply_history_token_ablation(self, result_tensor, result_list):
         """Apply dedicated history-token ablations for current experiments.
 
-        - pool_all_2x2_to_1x1: pool every history block (>1 tokens) to 1 token.
+        - pool_all_2x2_to_1x1: pool every *2x2 history block* (len==4) to 1 token.
         - drop_history_keep_latest_nav64: remove all history tokens; keep nav 8x8
           tokens untouched (they are appended separately as final_token_nav).
         """
@@ -280,8 +280,14 @@ class UniNaVIDMetaForCausalLM(ABC):
                 raise ValueError(
                     f"History block length mismatch, expect={L}, got={block.shape[0]}"
                 )
-            pooled_blocks.append(block if L == 1 else block.mean(dim=0, keepdim=True))
-            new_result_list.append(1)
+            # Only ablate 2x2 history blocks (4 tokens -> 1 token).
+            # Keep non-4 blocks unchanged to avoid accidental behavior drift.
+            if L == 4:
+                pooled_blocks.append(block.mean(dim=0, keepdim=True))
+                new_result_list.append(1)
+            else:
+                pooled_blocks.append(block)
+                new_result_list.append(L)
 
         if cursor != result_tensor_2d.shape[0]:
             raise ValueError(
