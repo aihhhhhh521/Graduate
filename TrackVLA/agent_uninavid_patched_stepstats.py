@@ -148,6 +148,7 @@ def evaluate_agent(
     log_every_n_steps: int = 1,
     seed: Optional[int] = None,
     token_ablation_mode: Optional[str] = None,
+    online_cache_prune_mode: Optional[str] = "step_window",
 ) -> None:
     """
     TrackVLA/EVT-Bench evaluation for Uni-NaVid agent with:
@@ -168,6 +169,11 @@ def evaluate_agent(
             token_ablation_mode
             if token_ablation_mode is not None
             else getattr(agent.model.config, "token_ablation_mode", None)
+        ),
+        "online_cache_prune_mode": (
+            online_cache_prune_mode
+            if online_cache_prune_mode is not None
+            else getattr(agent.model.config, "online_cache_prune_mode", "step_window")
         ),
     }
 
@@ -831,6 +837,8 @@ class UniNaVid_Agent(Agent):
 
         self.model.config.run_type = "eval"
         self.model.get_model().initialize_online_inference_nav_feat_cache()
+        if hasattr(self.model.get_model(), "reset_runtime_stats"):
+            self.model.get_model().reset_runtime_stats()
         self.model.get_model().new_frames = 0
         self.first_forward = False
 

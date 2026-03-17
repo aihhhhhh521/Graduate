@@ -115,7 +115,7 @@ def main():
     parser.add_argument(
         "--seed",
         type=int,
-        default=None,
+        default=100,
         help="Unified random seed for Python/NumPy/Torch/CUDA.",
     )
 
@@ -128,6 +128,19 @@ def main():
             "Token-ablation experiment mode. "
             "pool_all_2x2_to_1x1: pool every history 2x2 block to 1x1; "
             "drop_history_keep_latest_nav64: drop all history tokens and keep latest 8x8 nav tokens only."
+        ),
+    )
+    
+    parser.add_argument(
+        "--online-cache-prune-mode",
+        type=str,
+        default="step_window",
+        choices=["step_window", "episode_end", "off"],
+        help=(
+            "Online visual cache pruning strategy. "
+            "step_window: trim short-term cache every step (recommended for stable VRAM); "
+            "episode_end: keep full episode cache and clear at episode reset; "
+            "off: disable trimming (debug only)."
         ),
     )
 
@@ -154,6 +167,7 @@ def run_exp(
     log_every_n_steps: int = 1,
     seed: int = None,
     token_ablation_mode: str = None,
+    online_cache_prune_mode: str = "step_window",
     opts=None,
 ) -> None:
     if run_type == "eval":
@@ -178,6 +192,7 @@ def run_exp(
                 split_num=split_num,
                 ablation_config={
                     "token_ablation_mode": token_ablation_mode,
+                    "online_cache_prune_mode": online_cache_prune_mode,
                 },
                 seed=effective_seed,
             )
@@ -192,6 +207,7 @@ def run_exp(
                 log_every_n_steps=log_every_n_steps,
                 seed=effective_seed,
                 token_ablation_mode=token_ablation_mode,
+                online_cache_prune_mode=online_cache_prune_mode,
             )
         elif model_name == "baseline":
             from evt_bench.default import get_config

@@ -346,6 +346,22 @@ class UniNaVIDMetaForCausalLM(ABC):
         result_list = [1] * self.get_model().long_feat_cache.shape[0] + [nav_size] * length_threshold
         
         result_tensor = torch.cat([self.get_model().long_feat_cache, self.get_model().feat_cache[k - length_threshold:].reshape(-1,c)], dim=0)
+
+        cache_prune_mode = str(getattr(self.config, "online_cache_prune_mode", "step_window")).strip().lower()
+        if cache_prune_mode in ("", "none"):
+            cache_prune_mode = "off"
+
+        # step_window (default): keep only active short-term window every step.
+        # episode_end/off: keep full episode cache and only clear at reset.
+        if cache_prune_mode == "step_window":
+            self.get_model().feat_cache = self.get_model().feat_cache[k - length_threshold:]
+        elif cache_prune_mode in ("episode_end", "off"):
+            pass
+        else:
+            raise ValueError(
+                f"Unsupported online_cache_prune_mode: {cache_prune_mode}. "
+                "Valid modes: ['step_window', 'episode_end', 'off']"
+            )
         
         assert result_tensor.shape[0] == sum(result_list), f"The sum of the list does not match the tensor dimension {result_tensor.shape[0]}, {sum(result_list)}"
 
@@ -588,7 +604,7 @@ class UniNaVIDMetaForCausalLM(ABC):
             grid_size = None
         else:
             raise ValueError(f"Unsupported compress_type: {compress_type}")
-
+            
         # 1) Single image (or non-navigation single-frame): always 8x8 -> 64 tokens
         if image_counts is None or (image_counts == 1 and not navigation):
             vis_embed = process_grid(vis_embed, 8)
