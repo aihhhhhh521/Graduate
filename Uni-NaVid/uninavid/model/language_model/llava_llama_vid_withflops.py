@@ -51,6 +51,80 @@ class LlavaLlamaAttForCausalLM(LlamaForCausalLM, UniNaVIDMetaForCausalLM):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
 
+        # Initialize FLOPs statistics hooks
+        if getattr(config, 'enable_flop_hooks', False):
+            self._init_flop_hooks()
+        else:
+            self._flop_hooks = []
+            self.flop_stats = {'layers': [], 'total': 0}
+
+    def _init_flop_hooks(self):
+        """Register lightweight forward hooks on Transformer blocks to estimate FLOPs.
+
+        These numbers are only rough estimates, mainly for comparing dense vs.
+        sparse token usage across different settings.
+        """
+        # Try common places where transformer blocks are stored.
+        layers = getattr(self.model, "layers", None)
+        if layers is None:
+            backbone = getattr(self.model, "model", None)
+            layers = getattr(backbone, "layers", None)
+
+        if layers is None:
+            # Give up quietly if we cannot find layers (should not happen in LLaMA).
+            self.flop_stats = None
+            return
+
+        num_layers = len(layers)
+        self.flop_stats = {
+            "layers": [0 for _ in range(num_layers)],
+            "total": 0,
+        }
+
+        def make_block_hook(layer_idx):
+            def block_hook(module, inputs, outputs):
+                # inputs[0] is hidden_states: [B, T, C]
+                if not inputs:
+                    return
+                hidden_states = inputs[0]
+                if not isinstance(hidden_states, torch.Tensor) or hidden_states.ndim != 3:
+                    return
+
+                B, T, C = hidden_states.shape
+
+                # Number of heads
+                attn = getattr(module, "self_attn", None)
+                num_heads = getattr(attn, "num_heads", None)
+                if num_heads is None:
+                    num_heads = getattr(self.model.config, "num_attention_heads", 1)
+                num_heads = max(int(num_heads), 1)
+                d_head = C // num_heads
+
+                # Very rough FLOPs estimates for this block
+                attn_flops = 4 * B * T * C * C                      # Q, K, V, out projections
+                mha_flops = 2 * B * num_heads * T * T * d_head      # QK^T + AV
+                mlp_flops = 8 * B * T * C * C                       # 2-layer MLP with 4x expansion
+
+                block_flops = attn_flops + mha_flops + mlp_flops
+                self.flop_stats["layers"][layer_idx] += int(block_flops)
+                self.flop_stats["total"] += int(block_flops)
+
+            return block_hook
+
+        for idx, block in enumerate(layers):
+            try:
+                block.register_forward_hook(lambda module, inp, out, idx=idx: make_block_hook(idx)(module, inp, out))
+            except Exception:
+                # Do not crash if some blocks cannot register hooks.
+                continue
+
+    def reset_flop_stats(self):
+        """Reset FLOPs statistics before a new evaluation run."""
+        if getattr(self, "flop_stats", None) is not None:
+            num_layers = len(self.flop_stats["layers"])
+            self.flop_stats["layers"] = [0 for _ in range(num_layers)]
+            self.flop_stats["total"] = 0
+
     def get_model(self):
         return self.model
 
@@ -82,7 +156,8 @@ class LlavaLlamaAttForCausalLM(LlamaForCausalLM, UniNaVIDMetaForCausalLM):
 
         input_ids, attention_mask, past_key_values, inputs_embeds, labels = self.prepare_inputs_labels_for_multimodal(input_ids, attention_mask, past_key_values, labels, images, prompts=prompts)
 
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available() and getattr(self.config, 'empty_cache_after_prepare', False):
+            torch.cuda.empty_cache()
 
         outputs = self.model(
             input_ids=input_ids,
