@@ -7,7 +7,7 @@ IDX=0
 while [ $IDX -lt $CHUNKS ]; do
     for ((i = 0; i < NUM_PARALLEL && IDX < CHUNKS; i++)); do
         echo "Launching job IDX=$IDX on GPU=$((IDX % NUM_PARALLEL))"
-        CUDA_VISIBLE_DEVICES=$((i)) PYTHONPATH="habitat-lab" python run.py \
+        CUDA_VISIBLE_DEVICES=$((i)) PYTHONPATH="habitat-lab" python run_patched_stepstats.py \
             --split-num $CHUNKS \
             --split-id $IDX \
             --exp-config 'habitat-lab/habitat/config/benchmark/nav/track/track_infer_stt.yaml' \
