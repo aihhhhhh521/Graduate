@@ -174,7 +174,7 @@ def run_exp(
         if model_name == "uni-navid":
             from evt_bench.default import get_config
             from habitat.datasets import make_dataset
-            from agent_uninavid_patched_stepstats import evaluate_agent
+            from agent_uninavid import evaluate_agent
 
             config = get_config(exp_config)
             effective_seed = int(seed if seed is not None else config.habitat.simulator.seed)

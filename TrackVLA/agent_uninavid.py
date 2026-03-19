@@ -183,12 +183,12 @@ class UniNaVid_Agent(Agent):
         self.count_id = 0
         self.reset()
 
-        def process_images(self, rgb_list):
-            batch_image = np.asarray(rgb_list)
-            self.model.get_model().new_frames = len(rgb_list)
-            video = self.image_processor.preprocess(batch_image, return_tensors='pt')['pixel_values'].half().cuda()
+    def process_images(self, rgb_list):
+        batch_image = np.asarray(rgb_list)
+        self.model.get_model().new_frames = len(rgb_list)
+        video = self.image_processor.preprocess(batch_image, return_tensors='pt')['pixel_values'].half().cuda()
 
-            return [video]
+        return [video]
 
     def predict_inference(self, prompt):
         question = prompt.replace(DEFAULT_IMAGE_TOKEN, '').replace('\n', '')
