@@ -13,6 +13,8 @@ This script intentionally delays heavy imports until AFTER CUDA_VISIBLE_DEVICES 
 import argparse
 import os
 from pathlib import Path
+import random
+import numpy as np
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -93,9 +95,12 @@ def main() -> None:
         from habitat.config.default import get_config  # habitat-lab fallback
 
     from habitat.datasets import make_dataset
-    from agent_uninavid import evaluate_agent
+    # align with original agent format requested by user
+    from agent_uninavid_origin import evaluate_agent
 
     config = get_config(args.exp_config)
+    random.seed(config.habitat.simulator.seed)
+    np.random.seed(config.habitat.simulator.seed)
 
     # Set habitat-sim GPU id if present
     try:
@@ -133,32 +138,25 @@ def main() -> None:
         dataset.episodes = kept
         print(f"[render_train_split] episodes kept={len(kept)} missing_scenes={missing} scenes_dir={scenes_dir}")
 
-    # Run collection
-        # Run collection
-    # Default: episode-only output (one mp4 + one jsonl per episode) unless user explicitly wants clip mode.
-    # Default behavior: episode-only. Use --clip-mode to restore legacy per-inference clip outputs.
-    episode_only = (not bool(args.clip_mode))
+    os.makedirs(args.save_path, exist_ok=True)
+    # record experiment config + runtime args for reproducibility
+    run_manifest = {
+        "exp_config": args.exp_config,
+        "model_path": args.model_path,
+        "split_num": int(args.split_num),
+        "split_id": int(args.split_id),
+        "scenes_dir": args.scenes_dir,
+        "cuda_visible_devices": args.cuda_visible_devices,
+        "cuda_device": args.cuda_device,
+        "habitat_gpu_id": args.habitat_gpu_id,
+        "model_gpu_id": args.model_gpu_id,
+    }
+    import json
+    with open(Path(args.save_path) / "run_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(run_manifest, f, ensure_ascii=False, indent=2)
 
-    evaluate_agent(
-        config=config,
-        model_path=args.model_path,
-        dataset_split=dataset,
-        save_path=args.save_path,
-        cuda_device=int(args.model_gpu_id),
-        device_map=args.device_map,
-        load_4bit=(True if args.load_4bit else None),
-        load_8bit=(True if args.load_8bit else None),
-        max_new_tokens=args.max_new_tokens,
-        do_sample=args.do_sample,
-        # Output format control
-        save_episode_video=True,
-        save_clip_video=False if episode_only else True,
-        write_clip_jsonl=False if episode_only else True,
-        write_episode_jsonl=True,
-        episode_jsonl_name="track_episodes.jsonl",
-        # Habitat-sim GPU memory/leak mitigation
-        restart_env_every_episodes=int(args.restart_env_every_episodes),
-    )
+    # run once on train split shard with original evaluate_agent signature
+    evaluate_agent(config=config, model_path=args.model_path, dataset_split=dataset, save_path=args.save_path)
 
 
 if __name__ == "__main__":
