@@ -7,18 +7,14 @@ from uninavid.conversation import conv_templates, SeparatorStyle
 from uninavid.mm_utils import tokenizer_image_token, KeywordsStoppingCriteria
 
 import habitat
-
 import numpy as np
 import os
 import re
 import cv2
 import imageio
 from tqdm import trange
-
 import os.path as osp
 import json
-import random
-from typing import Optional
 from habitat.core.agent import Agent
 from habitat.utils.visualizations import maps
 from habitat.config.default_structured_configs import AgentConfig
@@ -26,208 +22,135 @@ from habitat.tasks.nav.nav import NavigationEpisode
 from habitat_sim.gfx import LightInfo, LightPositionModel
 from habitat.sims.habitat_simulator.actions import HabitatSimActions
 
-from trackvla_step_stats_utils import JSONLWriter, WallTimer, hz_from_ms
-
-
-def _set_global_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-
-
-def evaluate_agent(
-    config,
-    model_path,
-    dataset_split,
-    save_path,
-    split_id: Optional[int] = None,
-    enable_step_stats: bool = False,
-    log_every_n_steps: int = 1,
-    seed: int = None,
-    token_ablation_mode: str = None,
-    online_cache_prune_mode: str = "step_window",
-) -> None:
+def evaluate_agent(config, model_path, dataset_split, save_path) -> None:
     agent = UniNaVid_Agent(model_path, save_path)
-    effective_seed = int(seed) if seed is not None else int(config.habitat.simulator.seed)
-    _set_global_seed(effective_seed)
-
-    # Keep ablation config on both wrapper model config and inner model config.
-    setattr(agent.model.config, "token_ablation_mode", token_ablation_mode)
-    setattr(agent.model.config, "online_cache_prune_mode", online_cache_prune_mode)
-    inner_model = agent.model.get_model() if hasattr(agent.model, "get_model") else None
-    if inner_model is not None and hasattr(inner_model, "config"):
-        setattr(inner_model.config, "token_ablation_mode", token_ablation_mode)
-        setattr(inner_model.config, "online_cache_prune_mode", online_cache_prune_mode)
-
-    stats_writer = None
-    if enable_step_stats:
-        split_suffix = split_id if split_id is not None else -1
-        step_stats_path = os.path.join(save_path, f"step_stats_split{split_suffix}.jsonl")
-        stats_writer = JSONLWriter(step_stats_path)
-
     
     first_init = True
-    try:
-        with habitat.TrackEnv(
-            config=config,
-            dataset=dataset_split
-        ) as env:
-            sim = env.sim
-            agent.reset()
+    with habitat.TrackEnv(
+        config=config,
+        dataset=dataset_split
+    ) as env:
+        sim = env.sim
+        agent.reset()
+        
+        num_episodes = len(env.episodes)
+        for _ in trange(num_episodes):
+            obs = env.reset()
+            light_setup = [
+                LightInfo(
+                    vector=[10.0, -2.0, 0.0, 0.0],
+                    color=[1.0, 1.0, 1.0],
+                    model=LightPositionModel.Global,
+                ),
+                LightInfo(
+                    vector=[-10.0, -2.0, 0.0, 0.0],
+                    color=[1.0, 1.0, 1.0],
+                    model=LightPositionModel.Global,
+                ),
+                LightInfo(
+                    vector=[0.0, -2.0, 10.0, 0.0],
+                    color=[1.0, 1.0, 1.0],
+                    model=LightPositionModel.Global,
+                ),
+                LightInfo(
+                    vector=[0.0, -2.0, -10.0, 0.0],
+                    color=[1.0, 1.0, 1.0],
+                    model=LightPositionModel.Global,
+                ),
+            ]
+            sim.set_light_setup(light_setup)
 
-            num_episodes = len(env.episodes)
-            for _ in trange(num_episodes):
-                obs = env.reset()
-                light_setup = [
-                    LightInfo(
-                        vector=[10.0, -2.0, 0.0, 0.0],
-                        color=[1.0, 1.0, 1.0],
-                        model=LightPositionModel.Global,
-                    ),
-                    LightInfo(
-                        vector=[-10.0, -2.0, 0.0, 0.0],
-                        color=[1.0, 1.0, 1.0],
-                        model=LightPositionModel.Global,
-                    ),
-                    LightInfo(
-                        vector=[0.0, -2.0, 10.0, 0.0],
-                        color=[1.0, 1.0, 1.0],
-                        model=LightPositionModel.Global,
-                    ),
-                    LightInfo(
-                        vector=[0.0, -2.0, -10.0, 0.0],
-                        color=[1.0, 1.0, 1.0],
-                        model=LightPositionModel.Global,
-                    ),
-                ]
-                sim.set_light_setup(light_setup)
+            result = {}
+            record_infos = []
 
-                result = {}
-                record_infos = []
+            if first_init:
+                instruction = env.current_episode.info['instruction']
+                first_init = False
 
-                if first_init:
-                    instruction = env.current_episode.info['instruction']
-                    first_init = False
+            action_dict = dict()
+            finished = False
+            
+            humanoid_agent_main = sim.agents_mgr[0].articulated_agent
+            robot_agent = sim.agents_mgr[1].articulated_agent
 
-                action_dict = dict()
-                finished = False
+            iter_step = 0
+            followed_step = 0
+            human_no_move = 0
+            too_far_count = 0
+            status = 'Normal'
+            info = env.get_metrics()
+
+            while not env.episode_over:
+                record_info = {}
                 
-                humanoid_agent_main = sim.agents_mgr[0].articulated_agent
-                robot_agent = sim.agents_mgr[1].articulated_agent
+                obs = sim.get_sensor_observations()
 
-                iter_step = 0
-                followed_step = 0
-                human_no_move = 0
-                too_far_count = 0
-                status = 'Normal'
-                info = env.get_metrics()
+                detector = env.task._get_observations(env.current_episode)
+                action = agent.act(obs, info, instruction, env.current_episode.episode_id)
 
-                while not env.episode_over:
-                    step_timer = WallTimer()
-                    record_info = {}
-                    
-                    obs = sim.get_sensor_observations()
-
-                    detector = env.task._get_observations(env.current_episode)
-                    action = agent.act(obs, info, instruction, env.current_episode.episode_id)
-                    
-                    action_dict = {
-                        "action": ("agent_0_humanoid_navigate_action", "agent_1_base_velocity", "agent_2_oracle_nav_randcoord_action_obstacle", "agent_3_oracle_nav_randcoord_action_obstacle", "agent_4_oracle_nav_randcoord_action_obstacle", "agent_5_oracle_nav_randcoord_action_obstacle"),
-                        "action_args": {
-                            "agent_1_base_vel" : action
-                        }
+                action_dict = {
+                    "action": ("agent_0_humanoid_navigate_action", "agent_1_base_velocity", "agent_2_oracle_nav_randcoord_action_obstacle", "agent_3_oracle_nav_randcoord_action_obstacle", "agent_4_oracle_nav_randcoord_action_obstacle", "agent_5_oracle_nav_randcoord_action_obstacle"),
+                    "action_args": {
+                        "agent_1_base_vel" : action
                     }
-                    
-                    iter_step += 1
-                    env.step(action_dict)
+                }
+                
+                iter_step += 1
+                env.step(action_dict)
 
-                    info = env.get_metrics()
-                    if info['human_following'] == 1.0:
-                        print("Followed")
-                        followed_step += 1
-                        too_far_count = 0
-                    else:
-                        print("Lost")
+                info = env.get_metrics()
+                if info['human_following'] == 1.0:
+                    print("Followed")
+                    followed_step += 1
+                    too_far_count = 0
+                else:
+                    print("Lost")
 
-                    if np.linalg.norm(robot_agent.base_pos - humanoid_agent_main.base_pos) > 4.0:
-                        too_far_count += 1
-                        if too_far_count > 20:
-                            print("Too far from human!")
-                            status = 'Lost'
-                            finished = False
-                            break
-
-                    record_info["step"] = iter_step
-                    record_info["dis_to_human"] = float(np.linalg.norm(robot_agent.base_pos - humanoid_agent_main.base_pos))
-                    record_info["facing"] = info['human_following']
-                    record_infos.append(record_info)
-
-                    if enable_step_stats and stats_writer is not None and (iter_step % max(log_every_n_steps, 1) == 0):
-                        runtime_stats = {}
-                        runtime_holder = agent.model.get_model() if hasattr(agent.model, "get_model") else agent.model
-                        if hasattr(runtime_holder, "get_runtime_stats"):
-                            try:
-                                runtime_stats = runtime_holder.get_runtime_stats() or {}
-                            except Exception:
-                                runtime_stats = {}
-                        latest_vis_tokens = None
-                        if runtime_stats.get("vis_tokens_llm_steps"):
-                            latest_vis_tokens = runtime_stats["vis_tokens_llm_steps"][-1]
-
-                        stats_writer.write(
-                            {
-                                "episode_id": env.current_episode.episode_id,
-                                "step": iter_step,
-                                "seed": effective_seed,
-                                "token_ablation_mode": token_ablation_mode,
-                                "online_cache_prune_mode": online_cache_prune_mode,
-                                "step_wall_ms": step_timer.ms(),
-                                "step_fps": hz_from_ms(step_timer.ms()),
-                                "vis_tokens_step": latest_vis_tokens,
-                                "distance_to_human": record_info["dis_to_human"],
-                                "following": info["human_following"],
-                                "collision": info["human_collision"],
-                            }
-                        )
-
-                    if info['human_collision'] == 1.0:
-                        print("Collision detected!")
-                        status = 'Collision'
+                if np.linalg.norm(robot_agent.base_pos - humanoid_agent_main.base_pos) > 4.0:
+                    too_far_count += 1
+                    if too_far_count > 20:
+                        print("Too far from human!")
+                        status = 'Lost'
                         finished = False
                         break
-                        
-                    print(f"========== ID: {env.current_episode.episode_id} Step now is: {iter_step} action is: {action} dis_to_main_human: {np.linalg.norm(robot_agent.base_pos - humanoid_agent_main.base_pos)} ============")
 
-                print("finished episode id: ", env.current_episode.episode_id)
-                info = env.get_metrics()
-                agent.reset(env.current_episode)
+                record_info["step"] = iter_step
+                record_info["dis_to_human"] = float(np.linalg.norm(robot_agent.base_pos - humanoid_agent_main.base_pos))
+                record_info["facing"] = info['human_following']
+                record_infos.append(record_info)
 
-                if env.episode_over:
-                    finished = True
+                if info['human_collision'] == 1.0:
+                    print("Collision detected!")
+                    status = 'Collision'
+                    finished = False
+                    break
                 
-                scene_key = osp.splitext(osp.basename(env.current_episode.scene_id))[0].split('.')[0]
-                save_dir = os.path.join(save_path, scene_key)
-                os.makedirs(save_dir, exist_ok=True)
-                with open(os.path.join(save_dir, "{}_info.json".format(env.current_episode.episode_id)), "w") as f:
-                    json.dump(record_infos, f, indent=2) 
-                result['finish'] = finished
-                result['status'] = status
-                if iter_step < 300:
-                    result['success'] = info['human_following_success'] and info['human_following']
-                else:
-                    result['success'] = info['human_following']
-                result['following_rate'] = followed_step / iter_step
-                result['following_step'] = followed_step
-                result['total_step'] = iter_step
-                result['collision'] = info['human_collision']
-                with open(os.path.join(save_dir, "{}.json".format(env.current_episode.episode_id)), "w") as f:
-                    json.dump(result, f, indent=2)
-    finally:
-        if stats_writer is not None:
-            stats_writer.close() 
+                print(f"========== ID: {env.current_episode.episode_id} Step now is: {iter_step} action is: {action} dis_to_main_human: {np.linalg.norm(robot_agent.base_pos - humanoid_agent_main.base_pos)} ============")
+
+            print("finished episode id: ", env.current_episode.episode_id)
+            info = env.get_metrics()
+            agent.reset(env.current_episode)
+
+            if env.episode_over:
+                finished = True
+            
+            scene_key = osp.splitext(osp.basename(env.current_episode.scene_id))[0].split('.')[0]
+            save_dir = os.path.join(save_path, scene_key)
+            os.makedirs(save_dir, exist_ok=True)
+            with open(os.path.join(save_dir, "{}_info.json".format(env.current_episode.episode_id)), "w") as f:
+                json.dump(record_infos, f, indent=2) 
+            result['finish'] = finished
+            result['status'] = status
+            if iter_step < 300:
+                result['success'] = info['human_following_success'] and info['human_following']
+            else:
+                result['success'] = info['human_following']
+            result['following_rate'] = followed_step / iter_step
+            result['following_step'] = followed_step
+            result['total_step'] = iter_step
+            result['collision'] = info['human_collision']
+            with open(os.path.join(save_dir, "{}.json".format(env.current_episode.episode_id)), "w") as f:
+                json.dump(result, f, indent=2) 
 
 
 class UniNaVid_Agent(Agent):
@@ -239,6 +162,7 @@ class UniNaVid_Agent(Agent):
         self.require_data = True if "video" in exp_save else False
 
         self.conv_mode = "vicuna_v1"
+        
         if self.require_map or self.require_data:
             os.makedirs(self.result_path, exist_ok=True)
 
@@ -257,12 +181,14 @@ class UniNaVid_Agent(Agent):
         self.count_id = 0
         self.reset()
 
+
     def process_images(self, rgb_list):
         batch_image = np.asarray(rgb_list)
         self.model.get_model().new_frames = len(rgb_list)
         video = self.image_processor.preprocess(batch_image, return_tensors='pt')['pixel_values'].half().cuda()
 
         return [video]
+
 
     def predict_inference(self, prompt):
         question = prompt.replace(DEFAULT_IMAGE_TOKEN, '').replace('\n', '')
@@ -293,7 +219,6 @@ class UniNaVid_Agent(Agent):
 
         token_prompt = tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').cuda()
         indices_to_replace = torch.where(token_prompt == -200)[0]
-
         new_list = []
         while indices_to_replace.numel() > 0:
             idx = indices_to_replace[0]
@@ -309,7 +234,6 @@ class UniNaVid_Agent(Agent):
             indices_to_replace = torch.where(token_prompt == -200)[0]
         if token_prompt.numel() > 0:
             new_list.append(token_prompt)
-
         input_ids = torch.cat(new_list, dim=0).unsqueeze(0)
 
         stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
@@ -343,11 +267,12 @@ class UniNaVid_Agent(Agent):
 
         return outputs
 
+
     def addtext(self, image, instuction, navigation):
         h, w = image.shape[:2]
         new_height = h + 150
         new_image = np.zeros((new_height, w, 3), np.uint8)
-        new_image.fill(255)
+        new_image.fill(255)  
         new_image[:h, :w] = image
 
         font = cv2.FONT_HERSHEY_SIMPLEX
@@ -364,10 +289,11 @@ class UniNaVid_Agent(Agent):
         for word in words:
             test_line = line + ' ' + word if line else word
             test_line_size, _ = cv2.getTextSize(test_line, font, 0.5, 2)
+
             if test_line_size[0] > image.shape[1] - x:
                 cv2.putText(new_image, line, (x, y_line ), font, 0.5, (0, 0, 0), 2)
                 line = word
-                y_line += textsize[1] + 5
+                y_line += textsize[1]+5
             else:
                 line = test_line
 
@@ -378,6 +304,7 @@ class UniNaVid_Agent(Agent):
         new_image = cv2.putText(new_image, navigation, (x, y_line), font, 0.5, (0, 0, 0), 2)
 
         return new_image
+
 
     def reset(self, episode: NavigationEpisode = None):
         if len(self.topdown_map_list) != 0:
@@ -412,7 +339,7 @@ class UniNaVid_Agent(Agent):
         if self.require_map:
             top_down_map = maps.colorize_draw_agent_and_fit_to_height(info["top_down_map_following"], rgb.shape[0])
             output_im = np.concatenate((rgb, top_down_map), axis=1)
-            
+
         if len(self.pending_action_list) != 0 :
             temp_action = self.pending_action_list.pop(0)
             
@@ -445,3 +372,5 @@ class UniNaVid_Agent(Agent):
             raise ValueError("wrong actions!, please check the code and data")
         
         return action
+
+        
