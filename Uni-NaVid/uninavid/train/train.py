@@ -132,6 +132,11 @@ class ModelArguments:
     gater_temperature: float = field(default=1.0)
     gater_mode: str = field(default="soft")  # train uses soft; eval uses hard
     gater_loss_weight: float = field(default=0.1)
+    gater_sparsity_weight: float = field(default=1.0)
+    gater_binary_weight: float = field(default=0.01)
+    gater_temp_weight: float = field(default=0.0)
+    gater_target_ratio: Optional[float] = field(default=None)
+    # backward compatibility
     gater_ratio_weight: float = field(default=1.0)
     gater_entropy_weight: float = field(default=0.01)
     pretrain_mm_gater_adapter: Optional[str] = field(default=None)
@@ -1345,6 +1350,10 @@ def train():
         model.config.gater_temperature = model_args.gater_temperature
         model.config.gater_mode = model_args.gater_mode
         model.config.gater_loss_weight = model_args.gater_loss_weight
+        model.config.gater_sparsity_weight = model_args.gater_sparsity_weight
+        model.config.gater_binary_weight = model_args.gater_binary_weight
+        model.config.gater_temp_weight = model_args.gater_temp_weight
+        model.config.gater_target_ratio = model_args.gater_target_ratio
         model.config.gater_ratio_weight = model_args.gater_ratio_weight
         model.config.gater_entropy_weight = model_args.gater_entropy_weight
         model.config.pretrain_mm_gater_adapter = model_args.pretrain_mm_gater_adapter

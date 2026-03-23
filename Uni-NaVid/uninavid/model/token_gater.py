@@ -30,8 +30,11 @@ class TokenGater(nn.Module):
         k: int = 16,
         mode: str = "soft",              # "soft" (train) | "hard" (eval)
         temperature: float = 1.0,
-        ratio_weight: float = 1.0,
-        entropy_weight: float = 0.01,
+        sparsity_weight: float = 1.0,
+        binary_weight: float = 0.01,
+        temp_weight: float = 0.0,
+        target_ratio: float = None,
+        prev_probs: torch.Tensor = None,
         eps: float = 1e-6,
     ):
         assert x.dim() >= 2, f"Expected x [..., N, C], got {tuple(x.shape)}"
@@ -60,11 +63,33 @@ class TokenGater(nn.Module):
 
         probs = torch.sigmoid(scores / max(temperature, eps))                  # [..., N]
 
-        target_ratio = float(k) / float(max(N, 1))
+        # 1) Sparsity loss: L_sparsity = mean_t((g_bar_t - K/N)^2)
+        target_ratio = float(target_ratio) if target_ratio is not None else float(k) / float(max(N, 1))
         ratio = probs.mean(dim=-1)                                             # [...]
-        loss_ratio = (ratio - target_ratio).pow(2).mean()
-        loss_entropy = self._entropy_bernoulli(probs).mean()
-        aux_loss = ratio_weight * loss_ratio + entropy_weight * loss_entropy
+        loss_sparsity = (ratio - target_ratio).pow(2).mean()
+
+        # 2) Binary loss: L_binary = mean(g * (1 - g))
+        loss_binary = (probs * (1.0 - probs)).mean()
+
+        # 3) Temporal smoothness: L_temp = mean((g_t - g_{t-1})^2)
+        if prev_probs is not None:
+            if prev_probs.shape != probs.shape:
+                raise ValueError(f"prev_probs shape {tuple(prev_probs.shape)} != probs shape {tuple(probs.shape)}")
+            loss_temp = (probs - prev_probs).pow(2).mean()
+        else:
+            loss_temp = torch.zeros((), dtype=probs.dtype, device=probs.device)
+
+        aux_loss = (
+                sparsity_weight * loss_sparsity
+                + binary_weight * loss_binary
+                + temp_weight * loss_temp
+        )
+        aux_dict = {
+            "total": aux_loss,
+            "sparsity": loss_sparsity,
+            "binary": loss_binary,
+            "temp": loss_temp,
+        }
 
         x_keep = x * probs.unsqueeze(-1)                                       # [..., N, C]
 
@@ -73,4 +98,4 @@ class TokenGater(nn.Module):
         bg = (x * bg_w.unsqueeze(-1)).sum(dim=-2) / denom                      # [..., C]
         bg = bg.unsqueeze(-2)                                                  # [..., 1, C]
         y = torch.cat([x_keep, bg], dim=-2)                                    # [..., N+1, C]
-        return y, aux_loss, scores, probs
+        return y, aux_dict, scores, probs
