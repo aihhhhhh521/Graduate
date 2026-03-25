@@ -134,7 +134,7 @@ def evaluate_agent(
     episode_jsonl_name: str = "track_episodes.jsonl",
     clip_stride_infer: int = 1,     # 每 N 次推理保存一个 clip（默认每次都存）
     save_debug_video: bool = False,
-    restart_env_every_episodes: int = 50,
+    restart_env_every_episodes: int = 10,
     reuse_action_horizon: bool = False,
     # ====== online cache prune 策略 ======
     token_ablation_mode: Optional[str] = None,
@@ -300,15 +300,18 @@ def evaluate_agent(
                 with open(osp.join(save_dir, f"{env.current_episode.episode_id}.json"), "w") as f:
                     json.dump(result, f, indent=2)
 
-    if restart_env_every_episodes is None or int(restart_env_every_episodes) <= 0:
-        _run_chunk(episodes_all)
-    else:
-        k = int(restart_env_every_episodes)
-        for st in range(0, total_episodes, k):
-            ed = min(total_episodes, st + k)
-            _run_chunk(episodes_all[st:ed])
-            # 强制回收 python 侧对象，帮助 habitat-sim 释放资源（GL 上下文已在 with exit 时关闭）
-            gc.collect()
+    if restart_env_every_episodes not in (None, 1):
+        print(
+            f"[INFO] restart_env_every_episodes={restart_env_every_episodes} is overridden to 1 "
+            "to force per-episode Habitat renderer/context release."
+        )
+    for st in range(0, total_episodes, 1):
+        ed = st + 1
+        _run_chunk(episodes_all[st:ed])
+        # 强制回收 python 侧对象，帮助 habitat-sim 释放资源（GL 上下文已在 with exit 时关闭）
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 # =========================
 # UniNaVid Agent
 # =========================
@@ -696,6 +699,49 @@ class UniNaVid_Agent(Agent):
         except Exception as e:
             print(f"[WARN] online cache init skipped: {e}")
             self._cache_warmed = False
+    
+    def _release_model_caches(self) -> None:
+        """
+        强制释放与 episode 生命周期相关的模型缓存：
+        - UniNaVid online visual cache（feat_cache / long_feat_cache / online feats）
+        - generate 临时 KV / past cache（若实现里挂在模型对象上）
+        """
+        inner = self.model.get_model() if hasattr(self.model, "get_model") else None
+        targets = [t for t in (self.model, inner) if t is not None]
+
+        def _to_none_attr(obj, attr_name: str) -> None:
+            if not hasattr(obj, attr_name):
+                return
+            try:
+                val = getattr(obj, attr_name)
+                if torch.is_tensor(val):
+                    del val
+                elif isinstance(val, (list, tuple)):
+                    for x in val:
+                        if torch.is_tensor(x):
+                            del x
+                setattr(obj, attr_name, None)
+            except Exception:
+                pass
+
+        # common cache attributes across HF/UniNaVid variants
+        cache_attrs = (
+            "feat_cache",
+            "long_feat_cache",
+            "nav_feat_cache",
+            "online_feat_cache",
+            "_online_feat_cache",
+            "past_key_values",
+            "_past_key_values",
+            "cache",
+            "_cache",
+        )
+        for obj in targets:
+            for attr in cache_attrs:
+                _to_none_attr(obj, attr)
+
+        # Re-init UniNaVid online cache state after hard clear.
+        self._init_online_cache()
 
     # ------------------ video writing ------------------
     def _open_episode_video_writer(self, episode: NavigationEpisode, first_frame: np.ndarray) -> None:
@@ -781,7 +827,7 @@ class UniNaVid_Agent(Agent):
         self.topdown_map_list = []
 
         # 每个 episode 开始时重置 online cache（强约束：避免跨 episode 堆积导致显存爆炸）
-        self._init_online_cache()
+        self._release_model_caches()
 
         # episode writer 延迟到拿到第一帧再打开（需要知道分辨率）
         self._close_episode_video_writer()
@@ -836,7 +882,7 @@ class UniNaVid_Agent(Agent):
         self.topdown_map_list = []
 
         # 重置 online cache（避免显存长期累积）
-        self._init_online_cache()
+        self._release_model_caches()
 
         gc.collect()
         self._maybe_empty_cache(force=True)

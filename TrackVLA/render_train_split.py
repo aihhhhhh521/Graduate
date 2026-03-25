@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--do-sample", action="store_true", help="Enable sampling for generation (default off)")
     p.add_argument("--online-cache-prune-mode", default="step_window",
                    help="UniNaVid online visual cache prune mode (default: step_window, recommended for OOM prevention).")
-    p.add_argument("--restart-env-every-episodes", type=int, default=50,
+    p.add_argument("--restart-env-every-episodes", type=int, default=10,
                    help="Recreate TrackEnv every N episodes to prevent habitat-sim renderer GPU memory growth/leaks (default 50).")
     p.add_argument("--reuse-action-horizon", action="store_true",
                    help="If set, reuse next-k predicted actions (infer every k steps). Default off = infer every step (normal UniNaVid).")
