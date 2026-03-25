@@ -135,6 +135,10 @@ def evaluate_agent(
     clip_stride_infer: int = 1,     # 每 N 次推理保存一个 clip（默认每次都存）
     save_debug_video: bool = False,
     restart_env_every_episodes: int = 50,
+    reuse_action_horizon: bool = False,
+    # ====== online cache prune 策略 ======
+    token_ablation_mode: Optional[str] = None,
+    online_cache_prune_mode: str = "step_window",
 ) -> None:
     """
     评测 / 数据采集入口。
@@ -170,7 +174,16 @@ def evaluate_agent(
         episode_jsonl_name=episode_jsonl_name,
         clip_stride_infer=clip_stride_infer,
         save_debug_video=save_debug_video,
+        reuse_action_horizon=reuse_action_horizon,
     )
+    
+    # Keep runtime cache-prune options on both wrapper config and inner model config.
+    setattr(agent.model.config, "token_ablation_mode", token_ablation_mode)
+    setattr(agent.model.config, "online_cache_prune_mode", online_cache_prune_mode)
+    inner_model = agent.model.get_model() if hasattr(agent.model, "get_model") else None
+    if inner_model is not None and hasattr(inner_model, "config"):
+        setattr(inner_model.config, "token_ablation_mode", token_ablation_mode)
+        setattr(inner_model.config, "online_cache_prune_mode", online_cache_prune_mode)
 
     
     # ========= Habitat 环境（可能存在 renderer 侧显存缓慢增长/泄漏）=========
@@ -335,6 +348,7 @@ class UniNaVid_Agent(Agent):
         episode_jsonl_name: str = "track_episodes.jsonl",
         clip_stride_infer: int = 1,
         save_debug_video: bool = False,
+        reuse_action_horizon: bool = False,
     ) -> None:
         print("Initialize UniNaVid_Agent")
 
@@ -386,6 +400,7 @@ class UniNaVid_Agent(Agent):
         if self.action_horizon <= 0:
             raise ValueError("action_horizon must be > 0")
         self.clip_stride_infer = max(1, int(clip_stride_infer))
+        self.reuse_action_horizon = bool(reuse_action_horizon)
 
         self.save_episode_video = bool(save_episode_video)
         self.episode_video_fps = int(episode_video_fps)
@@ -1007,7 +1022,8 @@ class UniNaVid_Agent(Agent):
         """
         关键行为：
         - 每步把 RGB 放入 CPU deque（history_len=20）
-        - 每 action_horizon 步才推理 1 次（pending_actions 复用 next-4）
+        - 默认每一步都推理一次（normal UniNaVid 推理方式）
+        - 可选：reuse_action_horizon=True 时，每 action_horizon 步推理 1 次并复用 pending_actions
         - 每次推理保存一个 clip video（长度 history_len，fps=1），并写 sampled_500 风格 JSONL
         """
         if self.current_episode is None:
@@ -1034,8 +1050,10 @@ class UniNaVid_Agent(Agent):
         # 2) 整条 episode 视频（纯视频）
         self._append_episode_frame(rgb)
 
-        # 3) 是否需要推理（next-4 复用：显著加速）
-        if len(self.pending_actions) > 0:
+        # 3) 是否需要推理
+        # default: per-step inference (normal UniNaVid behavior)
+        # optional: horizon reuse for speed / fewer model calls
+        if self.reuse_action_horizon and len(self.pending_actions) > 0:
             action = self.pending_actions.pop(0)
             try:
                 self._episode_actions.append(action)
@@ -1043,7 +1061,7 @@ class UniNaVid_Agent(Agent):
                 pass
             return self._action_to_velocity(action)
 
-        # 推理（每 action_horizon 步一次）
+        # 推理（默认每步一次；reuse_action_horizon=True 时按 horizon 复用）
         navigation_qs, raw_out, actions = self._predict_actions(instruction)
 
         # 记录一次 prompt（可用于 debug；标注写入时使用 navigation_qs）
@@ -1083,8 +1101,11 @@ class UniNaVid_Agent(Agent):
             img = self._add_text(output_im, instruction, " ".join(actions))
             self.topdown_map_list.append(img)
 
-        # 4) 把剩余动作塞进 pending（下一步开始不再推理）
-        self.pending_actions = actions[1:]
+        # 4) 可选地把剩余动作塞进 pending（下一步开始不再推理）
+        if self.reuse_action_horizon:
+            self.pending_actions = actions[1:]
+        else:
+            self.pending_actions = []
         first_action = actions[0]
         try:
             self._episode_actions.append(first_action)
