@@ -96,7 +96,7 @@ def main() -> None:
 
     from habitat.datasets import make_dataset
     # align with original agent format requested by user
-    from agent_uninavid_origin import evaluate_agent
+    from agent_uninavid import evaluate_agent
 
     config = get_config(args.exp_config)
     random.seed(config.habitat.simulator.seed)
@@ -156,8 +156,13 @@ def main() -> None:
         json.dump(run_manifest, f, ensure_ascii=False, indent=2)
 
     # run once on train split shard with original evaluate_agent signature
-    evaluate_agent(config=config, model_path=args.model_path, dataset_split=dataset, save_path=args.save_path)
-
+    evaluate_agent(
+        config=config,
+        model_path=args.model_path,
+        dataset_split=dataset,
+        save_path=args.save_path,
+        online_cache_prune_mode="step_window",
+    )
 
 if __name__ == "__main__":
     main()
