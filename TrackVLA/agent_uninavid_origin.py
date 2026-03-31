@@ -179,6 +179,9 @@ class UniNaVid_Agent(Agent):
         self.topdown_map_list = []
 
         self.count_id = 0
+        self.runtime_max_new_tokens = 1024
+        self.runtime_do_sample = True
+        self.runtime_temperature = 0.2
         self.reset()
 
 
@@ -249,9 +252,9 @@ class UniNaVid_Agent(Agent):
             output_ids = self.model.generate(
                 input_ids,
                 images=imgs,
-                do_sample=True,
-                temperature=0.2,
-                max_new_tokens=1024,
+                do_sample=bool(self.runtime_do_sample),
+                temperature=float(self.runtime_temperature),
+                max_new_tokens=int(self.runtime_max_new_tokens),
                 use_cache=True,
                 stopping_criteria=[stopping_criteria])
 

@@ -25,6 +25,17 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--max-steps", type=int, default=300, help="Episode hard step cap")
     p.add_argument("--episode-video-fps", type=int, default=1, help="Output episode video fps (default 1)")
+    
+    p.add_argument(
+        "--online-cache-prune-mode",
+        type=str,
+        default="step_window",
+        choices=["step_window", "episode_end", "off"],
+        help="UniNaVid online cache prune mode.",
+    )
+    p.add_argument("--max-new-tokens", type=int, default=1024, help="Max new tokens for model generation")
+    p.add_argument("--do-sample", action="store_true", help="Enable sampling in model generation")
+    p.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature")
                    
     p.add_argument("--output-config-dirname", default="configs",
                    help="Directory name under save-path for training config files (default: configs).")
@@ -143,6 +154,19 @@ def _collect_with_origin_agent(args, config, dataset) -> None:
     episodes = list(getattr(dataset, "episodes", []))
 
     agent = UniNaVid_Agent(model_path=args.model_path, result_path=str(save_root), exp_save="collect")
+    
+    # Keep runtime cache-prune/generation options on both wrapper + inner model config.
+    agent.online_cache_prune_mode = args.online_cache_prune_mode
+    setattr(agent.model.config, "online_cache_prune_mode", args.online_cache_prune_mode)
+    inner_model = agent.model.get_model() if hasattr(agent.model, "get_model") else None
+    if inner_model is not None and hasattr(inner_model, "config"):
+        setattr(inner_model, "online_cache_prune_mode", args.online_cache_prune_mode)
+        setattr(inner_model.config, "online_cache_prune_mode", args.online_cache_prune_mode)
+
+    # Runtime generation knobs for conservative control without changing core logic.
+    agent.runtime_max_new_tokens = int(args.max_new_tokens)
+    agent.runtime_do_sample = bool(args.do_sample)
+    agent.runtime_temperature = float(args.temperature)
 
     # capture raw model textual output each step (teacher action tokens)
     agent._last_model_output = ""
@@ -299,11 +323,19 @@ def main() -> None:
             {
                 "exp_config": args.exp_config,
                 "model_path": args.model_path,
+                "agent_impl": "agent_uninavid_origin.UniNaVid_Agent",
                 "split_num": int(args.split_num),
                 "split_id": int(args.split_id),
                 "scenes_dir": args.scenes_dir,
                 "cuda_device": args.cuda_device,
                 "episode_video_fps": int(args.episode_video_fps),
+                "online_cache_prune_mode": args.online_cache_prune_mode,
+                "max_new_tokens": int(args.max_new_tokens),
+                "do_sample": bool(args.do_sample),
+                "temperature": float(args.temperature),
+                "dataset_split": str(getattr(config.habitat.dataset, "split", "")),
+                "dataset_data_path": str(getattr(config.habitat.dataset, "data_path", "")),
+                "fpv_sensor_key": "agent_1_articulated_agent_jaw_rgb",
             },
             f,
             ensure_ascii=False,
