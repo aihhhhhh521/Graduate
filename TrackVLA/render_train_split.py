@@ -1,60 +1,30 @@
-"""Render / collect a sharded split of episodes.
-Dual-GPU support (recommended):
-- Use --cuda-visible-devices "A,B" to expose two physical GPUs.
-- Use --habitat-gpu-id 0 (within visible devices) for Habitat-Sim rendering.
-- Use --model-gpu-id 1 (within visible devices) for UniNaVid inference.
-
-Backwards compatible:
-- --cuda-device <int> still works and exposes a single GPU.
-
-This script intentionally delays heavy imports until AFTER CUDA_VISIBLE_DEVICES is set.
-"""
-
 import argparse
+import json
 import os
-from pathlib import Path
 import random
+import shutil
+from pathlib import Path
+
+import cv2
 import numpy as np
 
-import json
-import shutil
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
 
-    p.add_argument("--exp-config", required=True, help="Habitat/TrackVLA config yaml")
+    p.add_argument("--exp-config", required=True, help="Habitat/TrackVLA config yaml (use STT train config)")
     p.add_argument("--model-path", required=True, help="Uni-NaVid (or compatible) model path")
     p.add_argument("--save-path", required=True, help="Output folder for collected data")
-    p.add_argument("--split-num", type=int, default=1, help="Total number of shards")
+    p.add_argument("--split-num", type=int, default=8, help="Total number of shards (default 8)")
     p.add_argument("--split-id", type=int, default=0, help="Shard index [0, split-num)")
     p.add_argument("--scenes-dir", default=None, help="Root directory for scene datasets (optional, used to skip missing scenes)")
 
     # GPU controls
     p.add_argument("--cuda-device", type=int, default=None,
-                   help="(Legacy) Physical GPU id to use. Sets CUDA_VISIBLE_DEVICES to this single id BEFORE imports.")
-    p.add_argument("--cuda-visible-devices", default=None,
-                   help='Comma-separated physical GPU ids to expose, e.g. "7,8". Overrides --cuda-device if set.')
-    p.add_argument("--habitat-gpu-id", type=int, default=0,
-                   help="Habitat-Sim gpu_device_id inside *visible* devices (default 0).")
-    p.add_argument("--model-gpu-id", type=int, default=0,
-                   help="UniNaVid torch cuda_device inside *visible* devices (default 0). For dual-GPU, set to 1.")
+                   help="Physical GPU id to use. Sets CUDA_VISIBLE_DEVICES BEFORE imports.")
 
-    # Model memory controls
-    p.add_argument("--device-map", default=None, help="HF device_map (default: None). If you set auto, it may use ALL visible GPUs.")
-    p.add_argument("--load-4bit", action="store_true", help="Load model in 4-bit (requires bitsandbytes)")
-    p.add_argument("--load-8bit", action="store_true", help="Load model in 8-bit (requires bitsandbytes)")
-    p.add_argument("--max-new-tokens", type=int, default=32, help="Max generation length for action decoding")
-    p.add_argument("--do-sample", action="store_true", help="Enable sampling for generation (default off)")
-    p.add_argument("--online-cache-prune-mode", default="step_window",
-                   help="UniNaVid online visual cache prune mode (default: step_window, recommended for OOM prevention).")
-    p.add_argument("--restart-env-every-episodes", type=int, default=10,
-                   help="Recreate TrackEnv every N episodes to prevent habitat-sim renderer GPU memory growth/leaks (default 50).")
-    p.add_argument("--reuse-action-horizon", action="store_true",
-                   help="If set, reuse next-k predicted actions (infer every k steps). Default off = infer every step (normal UniNaVid).")
-    p.add_argument("--episode-only", action="store_true",
-                   help="Collect ONE full episode video + ONE JSONL record per episode (recommended). Disables clip outputs.")
-    p.add_argument("--clip-mode", action="store_true",
-                   help="(Legacy) Collect many short clips + clip-level JSONL (sampled_500 style). Not recommended for your current goal.")
+    p.add_argument("--max-steps", type=int, default=300, help="Episode hard step cap")
+    p.add_argument("--episode-video-fps", type=int, default=1, help="Output episode video fps (default 1)")
                    
     p.add_argument("--output-config-dirname", default="configs",
                    help="Directory name under save-path for training config files (default: configs).")
@@ -67,13 +37,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def _resolve_scene_path(scene_id: str, scenes_dir: str) -> str:
-    """Resolve episode.scene_id against scenes_dir.
-
-    Handles common cases:
-    - scene_id is absolute
-    - scene_id is relative like "hm3d/train/.../scene.basis.glb"
-    - scene_id is mistakenly prefixed with "data/scene_datasets/..." (will strip that prefix)
-    """
     if not scene_id:
         return scene_id
     if os.path.isabs(scene_id):
@@ -87,16 +50,9 @@ def _resolve_scene_path(scene_id: str, scenes_dir: str) -> str:
     return os.path.join(scenes_dir, sid)
 
 def _materialize_train_layout(save_path: str, config_dirname: str, video_dirname: str, output_json_name: str) -> None:
-    """Convert collected episode JSONL to UniNaVid-train-ready JSON and split config/videos folders.
-
-    Expected source (generated by agent_uninavid_withmetrics):
-      {save_path}/uninavid_track_dataset/track_episodes.jsonl
-      {save_path}/uninavid_track_dataset/raw_videos/*.mp4
-    """
     root = Path(save_path)
     dataset_root = root / "uninavid_track_dataset"
     src_jsonl = dataset_root / "track_episodes.jsonl"
-    src_video_dir = dataset_root / "raw_videos"
 
     out_config_dir = root / config_dirname
     out_video_dir = root / video_dirname
@@ -160,113 +116,201 @@ def _materialize_train_layout(save_path: str, config_dirname: str, video_dirname
         f"samples={layout_manifest['num_samples']} missing_videos={missing_videos}"
     )
 
+
+def _safe_release(vw: cv2.VideoWriter) -> None:
+    try:
+        vw.release()
+    except Exception:
+        pass
+
+
+def _collect_with_origin_agent(args, config, dataset) -> None:
+    from habitat.datasets import make_dataset  # noqa: F401
+    import habitat
+    from habitat_sim.gfx import LightInfo, LightPositionModel
+    from agent_uninavid_origin import UniNaVid_Agent
+
+    save_root = Path(args.save_path)
+    dataset_root = save_root / "uninavid_track_dataset"
+    raw_video_dir = dataset_root / "raw_videos"
+    raw_video_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = dataset_root / "track_episodes.jsonl"
+
+    # fresh file for this shard run
+    if jsonl_path.exists():
+        jsonl_path.unlink()
+
+    episodes = list(getattr(dataset, "episodes", []))
+
+    agent = UniNaVid_Agent(model_path=args.model_path, result_path=str(save_root), exp_save="collect")
+
+    # capture raw model textual output each step (teacher action tokens)
+    agent._last_model_output = ""
+    _orig_predict = agent.predict_inference
+
+    def _predict_and_capture(prompt):
+        out = _orig_predict(prompt)
+        agent._last_model_output = out
+        return out
+
+    agent.predict_inference = _predict_and_capture
+
+    with habitat.TrackEnv(config=config, dataset=dataset) as env:
+        sim = env.sim
+        agent.reset()
+
+        for _ in range(len(episodes)):
+            obs = env.reset()
+            instruction = env.current_episode.info.get("instruction", "")
+            info = env.get_metrics()
+
+            light_setup = [
+                LightInfo(vector=[10.0, -2.0, 0.0, 0.0], color=[1.0, 1.0, 1.0], model=LightPositionModel.Global),
+                LightInfo(vector=[-10.0, -2.0, 0.0, 0.0], color=[1.0, 1.0, 1.0], model=LightPositionModel.Global),
+                LightInfo(vector=[0.0, -2.0, 10.0, 0.0], color=[1.0, 1.0, 1.0], model=LightPositionModel.Global),
+                LightInfo(vector=[0.0, -2.0, -10.0, 0.0], color=[1.0, 1.0, 1.0], model=LightPositionModel.Global),
+            ]
+            sim.set_light_setup(light_setup)
+
+            scene_key = Path(env.current_episode.scene_id).name.split(".")[0]
+            sample_id = f"NAV_ID_TRACK_{scene_key}_{env.current_episode.episode_id}"
+            video_rel = f"raw_videos/EP_{scene_key}_{env.current_episode.episode_id}.mp4"
+            video_abs = dataset_root / video_rel
+
+            action_tokens = []
+            writer = None
+
+            try:
+                step = 0
+                while (not env.episode_over) and (step < int(args.max_steps)):
+                    rgb = obs.get("agent_1_articulated_agent_jaw_rgb")
+                    if rgb is None:
+                        raise KeyError("Missing required FPV key: agent_1_articulated_agent_jaw_rgb")
+                    rgb = rgb[:, :, :3]
+                    if rgb.dtype != np.uint8:
+                        rgb = rgb.astype(np.uint8)
+
+                    if writer is None:
+                        h, w = rgb.shape[:2]
+                        video_abs.parent.mkdir(parents=True, exist_ok=True)
+                        writer = cv2.VideoWriter(
+                            str(video_abs),
+                            cv2.VideoWriter_fourcc(*"mp4v"),
+                            float(args.episode_video_fps),
+                            (w, h),
+                        )
+                        if not writer.isOpened():
+                            raise RuntimeError(f"Failed to open writer: {video_abs}")
+                    writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+
+                    act_vec = agent.act(obs, info, instruction, env.current_episode.episode_id)
+                    raw = str(getattr(agent, "_last_model_output", "")).strip().lower()
+                    first = raw.split()[0] if raw else "stop"
+                    if first not in {"forward", "left", "right", "back", "stop"}:
+                        first = "stop"
+                    action_tokens.append(first)
+
+                    action_dict = {
+                        "action": (
+                            "agent_0_humanoid_navigate_action",
+                            "agent_1_base_velocity",
+                            "agent_2_oracle_nav_randcoord_action_obstacle",
+                            "agent_3_oracle_nav_randcoord_action_obstacle",
+                            "agent_4_oracle_nav_randcoord_action_obstacle",
+                            "agent_5_oracle_nav_randcoord_action_obstacle",
+                        ),
+                        "action_args": {"agent_1_base_vel": act_vec},
+                    }
+                    obs = env.step(action_dict)
+                    info = env.get_metrics()
+                    step += 1
+
+            finally:
+                if writer is not None:
+                    _safe_release(writer)
+                try:
+                    agent.reset(env.current_episode)
+                except Exception:
+                    pass
+
+            rec = {
+                "id": sample_id,
+                "video": video_rel,
+                "conversations": [
+                    {
+                        "from": "human",
+                        "value": (
+                            "Imagine you are a robot programmed for navigation tasks. "
+                            "You have been given a video of historical observations and an image of the current observation <image>. "
+                            f"Your assigned task is: '{instruction}'. "
+                            "Analyze this series of images to determine your next four actions. "
+                            "The predicted action should be one of the following: forward, left, right, back, or stop."
+                        ),
+                    },
+                    {"from": "gpt", "value": " ".join(action_tokens)},
+                ],
+                "meta": {
+                    "steps": len(action_tokens),
+                    "split_num": int(args.split_num),
+                    "split_id": int(args.split_id),
+                    "exp_config": args.exp_config,
+                },
+            }
+            with open(jsonl_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
 def main() -> None:
     args = parse_args()
 
-    # Must be set BEFORE torch/habitat import to take effect
-    if args.cuda_visible_devices is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.cuda_visible_devices)
-    elif args.cuda_device is not None:
+    if args.cuda_device is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.cuda_device)
 
     # Helps fragmentation (matches the OOM hint) - safe no-op if already set
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-    # Optional hint for other libs (harmless if unused)
-    os.environ["TRACKVLA_CUDA_DEVICE"] = str(int(args.model_gpu_id))
-
-    # Heavy imports AFTER env is set
-    try:
-        from evt_bench.default import get_config  # TrackVLA / EVT-style config
-    except Exception:
-        from habitat.config.default import get_config  # habitat-lab fallback
-
+    from evt_bench.default import get_config
     from habitat.datasets import make_dataset
-    # Use collector that writes FPV episode videos + UniNaVid-style JSONL.
-    from agent_uninavid_withmetrics import evaluate_agent
     
     config = get_config(args.exp_config)
     random.seed(config.habitat.simulator.seed)
     np.random.seed(config.habitat.simulator.seed)
-
-    # Set habitat-sim GPU id if present
-    try:
-        config.habitat.simulator.habitat_sim_v0.gpu_device_id = int(args.habitat_gpu_id)
-    except Exception:
-        pass
 
     dataset = make_dataset(id_dataset=config.habitat.dataset.type, config=config.habitat.dataset)
 
     # Shard episodes
     if args.split_num and args.split_num > 1:
         eps = list(getattr(dataset, "episodes", []))
-        keep = []
-        for idx, ep in enumerate(eps):
-            if idx % args.split_num == args.split_id:
-                keep.append(ep)
-        dataset.episodes = keep
+        dataset.episodes = [ep for idx, ep in enumerate(eps) if idx % args.split_num == args.split_id]
 
     # Optionally skip missing scenes (prevents hard crashes)
     if args.scenes_dir:
         scenes_dir = str(Path(args.scenes_dir).expanduser().resolve())
         kept = []
-        missing = 0
         for ep in dataset.episodes:
-            try:
-                scene_id = getattr(ep, "scene_id")
-            except Exception:
-                kept.append(ep)
-                continue
+            scene_id = getattr(ep, "scene_id", None)
             scene_path = _resolve_scene_path(scene_id, scenes_dir)
-            if os.path.exists(scene_path):
+            if scene_path and os.path.exists(scene_path):
                 kept.append(ep)
-            else:
-                missing += 1
         dataset.episodes = kept
-        print(f"[render_train_split] episodes kept={len(kept)} missing_scenes={missing} scenes_dir={scenes_dir}")
 
     os.makedirs(args.save_path, exist_ok=True)
-    # record experiment config + runtime args for reproducibility
-    run_manifest = {
-        "exp_config": args.exp_config,
-        "model_path": args.model_path,
-        "split_num": int(args.split_num),
-        "split_id": int(args.split_id),
-        "scenes_dir": args.scenes_dir,
-        "cuda_visible_devices": args.cuda_visible_devices,
-        "cuda_device": args.cuda_device,
-        "habitat_gpu_id": args.habitat_gpu_id,
-        "model_gpu_id": args.model_gpu_id,
-        "online_cache_prune_mode": args.online_cache_prune_mode,
-        "reuse_action_horizon": bool(args.reuse_action_horizon),
-    }
     with open(Path(args.save_path) / "run_manifest.json", "w", encoding="utf-8") as f:
-        json.dump(run_manifest, f, ensure_ascii=False, indent=2)
+        json.dump(
+            {
+                "exp_config": args.exp_config,
+                "model_path": args.model_path,
+                "split_num": int(args.split_num),
+                "split_id": int(args.split_id),
+                "scenes_dir": args.scenes_dir,
+                "cuda_device": args.cuda_device,
+                "episode_video_fps": int(args.episode_video_fps),
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
-    # run once on train split shard with original evaluate_agent signature
-    evaluate_agent(
-        config=config,
-        model_path=args.model_path,
-        dataset_split=dataset,
-        save_path=args.save_path,
-         cuda_device=int(args.model_gpu_id),
-        device_map=args.device_map,
-        load_4bit=bool(args.load_4bit),
-        load_8bit=bool(args.load_8bit),
-        max_new_tokens=int(args.max_new_tokens),
-        do_sample=bool(args.do_sample),
-        save_episode_video=True,
-        save_clip_video=False,
-        write_clip_jsonl=False,
-        write_episode_jsonl=True,
-        episode_jsonl_name="track_episodes.jsonl",
-        save_debug_video=False,
-        restart_env_every_episodes=int(args.restart_env_every_episodes),
-        action_horizon=4,
-        history_len=20,
-        reuse_action_horizon=bool(args.reuse_action_horizon),
-        online_cache_prune_mode=str(args.online_cache_prune_mode),
-    )
+    _collect_with_origin_agent(args=args, config=config, dataset=dataset)
     _materialize_train_layout(
         save_path=args.save_path,
         config_dirname=args.output_config_dirname,
