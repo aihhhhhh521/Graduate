@@ -19,6 +19,23 @@ TEMPERATURE="${TEMPERATURE:-0.2}"
 DRY_RUN="${DRY_RUN:-0}"
 SYNC_RUN="${SYNC_RUN:-0}"                 # 1: serial run, 0: background all
 
+declare -A GPU_ACTIVE_PID=()
+declare -A GPU_ACTIVE_SPLIT=()
+
+wait_gpu_slot_if_busy() {
+  local gpu="$1"
+  local pid="${GPU_ACTIVE_PID[$gpu]:-}"
+  local running_split="${GPU_ACTIVE_SPLIT[$gpu]:-}"
+  if [[ -n "${pid}" ]]; then
+    echo "[render_bash] GPU ${gpu} is busy (split_${running_split}, pid=${pid}), waiting..."
+    wait "${pid}"
+    echo "[render_bash] GPU ${gpu} released."
+    unset GPU_ACTIVE_PID["$gpu"]
+    unset GPU_ACTIVE_SPLIT["$gpu"]
+  fi
+}
+
+
 usage() {
   cat <<USAGE
 Usage: bash render_bash.sh [options]
@@ -103,13 +120,22 @@ for ((sid=START_SPLIT; sid<SPLITS; sid++)); do
   if [[ "${SYNC_RUN}" == "1" ]]; then
     CUDA_VISIBLE_DEVICES="${gpu_id}" "${cmd[@]}" 2>&1 | tee "${SAVE_ROOT}/split_${sid}.log"
   else
+    wait_gpu_slot_if_busy "${gpu_id}"
     CUDA_VISIBLE_DEVICES="${gpu_id}" "${cmd[@]}" > "${SAVE_ROOT}/split_${sid}.log" 2>&1 &
-    echo "[render_bash] started split_${sid} on GPU ${gpu_id}"
+    pid=$!
+    GPU_ACTIVE_PID["$gpu_id"]="${pid}"
+    GPU_ACTIVE_SPLIT["$gpu_id"]="${sid}"
+    echo "[render_bash] started split_${sid} on GPU ${gpu_id} (pid=${pid})"
   fi
 done
 
 if [[ "${DRY_RUN}" != "1" && "${SYNC_RUN}" != "1" ]]; then
-  wait
+  for gpu in "${!GPU_ACTIVE_PID[@]}"; do
+    pid="${GPU_ACTIVE_PID[$gpu]}"
+    sid="${GPU_ACTIVE_SPLIT[$gpu]}"
+    echo "[render_bash] waiting split_${sid} on GPU ${gpu} (pid=${pid})"
+    wait "${pid}"
+  done
 fi
 
 echo "[render_bash] done."
