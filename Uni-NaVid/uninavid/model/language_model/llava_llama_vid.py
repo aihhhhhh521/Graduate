@@ -80,11 +80,6 @@ class LlavaLlamaAttForCausalLM(LlamaForCausalLM, UniNaVIDMetaForCausalLM):
             if input_ids.device != self.device:
                 input_ids = input_ids.to(device=self.device)
 
-        if hasattr(self.get_model(), "gater_aux_loss"):
-            self.get_model().gater_aux_loss = None
-        if hasattr(self.get_model(), "_gater_prev_probs"):
-            self.get_model()._gater_prev_probs = None
-
         input_ids, attention_mask, past_key_values, inputs_embeds, labels = self.prepare_inputs_labels_for_multimodal(input_ids, attention_mask, past_key_values, labels, images, prompts=prompts)
 
         torch.cuda.empty_cache()
@@ -114,12 +109,6 @@ class LlavaLlamaAttForCausalLM(LlamaForCausalLM, UniNaVIDMetaForCausalLM):
 
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
-
-            if getattr(self.config, "mm_use_gater", False):
-                aux = getattr(self.get_model(), "gater_aux_loss", None)
-                if aux is not None:
-                    w = float(getattr(self.config, "gater_loss_weight", 0.1))
-                    loss = loss + w * aux
 
         if not return_dict:
             output = (logits,) + outputs[1:]
