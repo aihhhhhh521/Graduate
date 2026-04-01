@@ -1,4 +1,5 @@
 import argparse
+import gc
 import json
 import os
 import random
@@ -134,6 +135,20 @@ def _safe_release(vw: cv2.VideoWriter) -> None:
     except Exception:
         pass
 
+def _hard_cuda_cleanup() -> None:
+    """Best-effort CUDA memory cleanup between episodes for long runs."""
+    gc.collect()
+    try:
+        import torch  # local import to avoid forcing torch load for dry paths
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        # Keep data collection robust even if cleanup hooks are unavailable.
+        pass
+
 
 def _collect_with_origin_agent(args, config, dataset) -> None:
     from habitat.datasets import make_dataset  # noqa: F401
@@ -256,6 +271,7 @@ def _collect_with_origin_agent(args, config, dataset) -> None:
                     agent.reset(env.current_episode)
                 except Exception:
                     pass
+                _hard_cuda_cleanup()
 
             rec = {
                 "id": sample_id,

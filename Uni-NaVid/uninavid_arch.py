@@ -27,7 +27,6 @@ import torch.nn.functional as F
 
 from .multimodal_encoder.builder import build_vision_tower
 from .multimodal_projector.builder import build_vision_projector
-from .token_gater import TokenGater
 
 
 from uninavid.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, VIDEO_START_SPECIAL_TOKEN, VIDEO_END_SPECIAL_TOKEN, IMAGE_START_TOKEN, IMAGE_END_TOKEN, NAVIGATION_SPECIAL_TOKEN, NAVIGATION_IDENTIFIER, IAMGE_SEPARATOR
@@ -83,36 +82,6 @@ class UniNaVIDMetaModel:
         self.config.mm_vision_select_layer = mm_vision_select_layer
         self.config.mm_vision_select_feature = mm_vision_select_feature
         self.config.max_token = max_token
-
-
-        # ---- gater config (pluggable token pruning) ----
-        self.config.mm_use_gater = getattr(model_args, 'mm_use_gater', False)
-        self.config.gater_k = getattr(model_args, 'gater_k', 16)
-        self.config.gater_hidden_dim = getattr(model_args, 'gater_hidden_dim', 256)
-        self.config.gater_temperature = getattr(model_args, 'gater_temperature', 1.0)
-        self.config.gater_mode = getattr(model_args, 'gater_mode', 'soft')
-        self.config.gater_loss_weight = getattr(model_args, 'gater_loss_weight', 0.1)
-        self.config.gater_sparsity_weight = getattr(
-            model_args, 'gater_sparsity_weight', getattr(model_args, 'gater_ratio_weight', 1.0)
-        )
-        self.config.gater_binary_weight = getattr(
-            model_args, 'gater_binary_weight', getattr(model_args, 'gater_entropy_weight', 0.01)
-        )
-        self.config.gater_temp_weight = getattr(model_args, 'gater_temp_weight', 0.0)
-        self.config.gater_target_ratio = getattr(model_args, 'gater_target_ratio', None)
-        self.config.pretrain_mm_gater_adapter = getattr(model_args, 'pretrain_mm_gater_adapter', None)
-
-        if self.config.mm_use_gater and getattr(self, 'token_gater', None) is None:
-            self.token_gater = TokenGater(
-                in_dim=self.config.mm_hidden_size,
-                hidden_dim=self.config.gater_hidden_dim,
-            )
-
-        if self.config.mm_use_gater and self.config.pretrain_mm_gater_adapter is not None:
-            gater_w = torch.load(self.config.pretrain_mm_gater_adapter, map_location='cpu')
-            if isinstance(gater_w, dict) and any(k.startswith('token_gater.') for k in gater_w.keys()):
-                gater_w = {k.split('token_gater.', 1)[1]: v for k, v in gater_w.items() if k.startswith('token_gater.')}
-            self.token_gater.load_state_dict(gater_w, strict=True)
         
         if getattr(self, 'mm_projector', None) is None:
             self.mm_projector = build_vision_projector(self.config)
@@ -386,6 +355,9 @@ class UniNaVIDMetaForCausalLM(ABC):
         # episode_end/off: keep full episode cache and only clear at reset.
         if cache_prune_mode == "step_window":
             self.get_model().feat_cache = self.get_model().feat_cache[k - length_threshold:]
+            long_term_cache = getattr(self.get_model(), "long_feat_cache", None)
+            if long_term_cache is not None and long_term_cache.shape[0] > length_threshold:
+                self.get_model().long_feat_cache = long_term_cache[-length_threshold:]
         elif cache_prune_mode in ("episode_end", "off"):
             pass
         else:
@@ -485,7 +457,7 @@ class UniNaVIDMetaForCausalLM(ABC):
         compress_type = self.config.compress_type
         online_length_threshold = getattr(self.config, "online_length_threshold", 64)
         online_similarity_threshold = getattr(self.config, "online_similarity_threshold", 0.985)
-        compress_grid_sizes = {"grid:2": 4, "grid:4": 16, "mean": 1}
+        compress_grid_sizes = {"grid:2": 16, "grid:4": 16, "mean": 1}
 
         nav_size = compress_grid_sizes.get(compress_type)
         if nav_size is None:
@@ -646,11 +618,12 @@ class UniNaVIDMetaForCausalLM(ABC):
             # nav query uses only the current frame (last)
             vis_embed_nav = process_grid(vis_embed[-1:], 8)
 
-            # history/current sequence for cache
-            if grid_size is None:
+            # For short-term history tokens, keep a denser 4x4 grid when compress_type=grid:2.
+            history_grid_size = 4 if grid_size == 2 else grid_size
+            if history_grid_size is None:
                 vis_embed = process_mean(vis_embed)
             else:
-                vis_embed = process_grid(vis_embed, grid_size)
+                vis_embed = process_grid(vis_embed, history_grid_size)
 
         # 3) Pure video QA: compress the whole sequence
         else:
@@ -659,43 +632,6 @@ class UniNaVIDMetaForCausalLM(ABC):
                 vis_embed = process_mean(vis_embed)
             else:
                 vis_embed = process_grid(vis_embed, grid_size)
-
-        if (
-                navigation
-                and vis_embed_nav is not None
-                and getattr(self.config, "mm_use_gater", False)
-                and hasattr(self.get_model(), "token_gater")
-        ):
-            mode = getattr(self.config, "gater_mode", "soft")
-            if getattr(self.config, "run_type", None) == "eval":
-                mode = "hard"
-
-            k = int(getattr(self.config, "gater_k", 16))
-            temp = float(getattr(self.config, "gater_temperature", 1.0))
-            sparsity_w = float(getattr(self.config, "gater_sparsity_weight", 1.0))
-            binary_w = float(getattr(self.config, "gater_binary_weight", 0.01))
-            temp_w = float(getattr(self.config, "gater_temp_weight", 0.0))
-            target_ratio = getattr(self.config, "gater_target_ratio", None)
-            prev_probs = getattr(self.get_model(), "_gater_prev_probs", None)
-
-            vis_embed_nav, aux_dict, _, probs = self.get_model().token_gater(
-                vis_embed_nav,
-                k=k,
-                mode=mode,
-                temperature=temp,
-                sparsity_weight=sparsity_w,
-                binary_weight=binary_w,
-                temp_weight=temp_w,
-                target_ratio=target_ratio,
-                prev_probs=prev_probs,
-            )
-            self.get_model()._gater_prev_probs = probs.detach() if probs is not None else None
-
-            if aux_dict is not None and aux_dict.get("total") is not None:
-                if getattr(self.get_model(), "gater_aux_loss", None) is None:
-                    self.get_model().gater_aux_loss = aux_dict["total"]
-                else:
-                    self.get_model().gater_aux_loss = self.get_model().gater_aux_loss + aux_dict["total"]
 
         # Project to LLM hidden size
         vis_embed = self.get_model().mm_projector(vis_embed)
@@ -707,7 +643,6 @@ class UniNaVIDMetaForCausalLM(ABC):
             self.get_model().feat_cache = vis_embed
 
         vis_embed_nav = self.get_model().mm_projector(vis_embed_nav) if navigation else None
-
         return vis_embed, vis_embed_nav
     def update_prompt(self, prompts=None):
         self.prompts = prompts
@@ -718,7 +653,7 @@ class UniNaVIDMetaForCausalLM(ABC):
         if 'grid' in self.config.compress_type:
             grid_size = int(self.config.compress_type.split('grid:')[-1])
             if grid_size == 2:
-                nav_size = 4
+                nav_size = 16
             elif grid_size == 4:
                 nav_size = 16
             else:
