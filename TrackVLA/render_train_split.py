@@ -154,7 +154,7 @@ def _collect_with_origin_agent(args, config, dataset) -> None:
     from habitat.datasets import make_dataset  # noqa: F401
     import habitat
     from habitat_sim.gfx import LightInfo, LightPositionModel
-    from agent_uninavid_origin import UniNaVid_Agent
+    from agent_uninavid import UniNaVid_Agent
 
     save_root = Path(args.save_path)
     dataset_root = save_root / "uninavid_track_dataset"
