@@ -339,7 +339,7 @@ def main() -> None:
             {
                 "exp_config": args.exp_config,
                 "model_path": args.model_path,
-                "agent_impl": "agent_uninavid_origin.UniNaVid_Agent",
+                "agent_impl": "agent_uninavid.UniNaVid_Agent",
                 "split_num": int(args.split_num),
                 "split_id": int(args.split_id),
                 "scenes_dir": args.scenes_dir,
