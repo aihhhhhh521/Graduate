@@ -720,16 +720,13 @@ class UniNaVIDMetaForCausalLM(ABC):
                 assert cur_labels.shape == cur_input_ids.shape
 
             if not long_video:
-                token_idx = 0
-                _fastv_first_image_token_start = None  # position of first visual token in the embedding seq
+                token_idx = 0  
                 while image_token_indices.numel() > 0:
                     if isinstance(image_features, list):
                         cur_image_features = image_features[cur_image_idx][token_idx]
                     else:
                         cur_image_features = image_features[cur_image_idx]
                     image_token_start = image_token_indices[0]
-                    if _fastv_first_image_token_start is None:
-                        _fastv_first_image_token_start = int(image_token_start)
 
                     if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config,
                                                                                       'mm_use_im_start_end', False):
@@ -832,9 +829,6 @@ class UniNaVIDMetaForCausalLM(ABC):
                     image_token_indices = torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0]
                     token_idx += 1
 
-                # FastV: capture remaining text-suffix length before appending it
-                _fastv_text_suffix = int(cur_input_ids.numel())
-
                 # changle image idx after processing one sample
                 cur_image_idx += 1
                 if cur_input_ids.numel() > 0:
@@ -847,17 +841,6 @@ class UniNaVIDMetaForCausalLM(ABC):
                         cur_new_labels.append(cur_labels)
                 cur_new_input_embeds = [x.to(device=self.device) for x in cur_new_input_embeds]
                 cur_new_input_embeds = torch.cat(cur_new_input_embeds, dim=0)
-
-                # FastV: store (start, length) of the visual-token span so the
-                # LLM forward pass can pass them into fastv_forward.
-                if _fastv_first_image_token_start is not None:
-                    _fastv_vis_len = (
-                            int(cur_new_input_embeds.shape[0])
-                            - _fastv_first_image_token_start
-                            - _fastv_text_suffix
-                    )
-                    self.get_model()._fastv_image_token_start = _fastv_first_image_token_start
-                    self.get_model()._fastv_image_token_length = max(0, _fastv_vis_len)
 
                 if hasattr(self, "_attach_llm_input_token_structure"):
                     self._attach_llm_input_token_structure(int(cur_new_input_embeds.shape[0]))

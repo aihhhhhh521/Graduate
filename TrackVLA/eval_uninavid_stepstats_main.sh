@@ -16,9 +16,7 @@ while [ $IDX -lt $CHUNKS ]; do
             --model-path $MODEL_PATH \
             --model-name 'uni-navid' \
             --enable-step-stats \
-            --log-every-n-steps 1 \
-            --fastv-k 3 \
-            --fastv-r 0.5 &
+            --log-every-n-steps 1 &
         ((IDX++))
     done
     wait

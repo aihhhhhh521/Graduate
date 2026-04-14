@@ -26,7 +26,6 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from uninavid.model.uninavid_arch import UniNaVIDMetaModel, UniNaVIDMetaForCausalLM
 from uninavid.constants import NAVIGATION_IDENTIFIER
-from .fastv_llama import FastVLlamaModel
 
 import os
 print("Setting WANDB_MODE to offline")
@@ -36,7 +35,7 @@ os.environ["WANDB_MODE"] = "offline"
 class LlavaConfig(LlamaConfig):
     model_type = "llava"
 
-class LlavaAttLlamaModel(UniNaVIDMetaModel, FastVLlamaModel):
+class LlavaAttLlamaModel(UniNaVIDMetaModel, LlamaModel):
     config_class = LlavaConfig
 
     def __init__(self, config: LlamaConfig):
@@ -85,42 +84,16 @@ class LlavaLlamaAttForCausalLM(LlamaForCausalLM, UniNaVIDMetaForCausalLM):
 
         torch.cuda.empty_cache()
 
-        # FastV: only apply on the prefill pass (past_key_values is None / empty).
-        # On decode steps past_key_values is populated so we fall through to the
-        # regular LlamaModel forward path.
-        _fastv_config = getattr(self.config, "fastv_config", None)
-        _is_prefill = not past_key_values
-        if _fastv_config is not None and _is_prefill:
-            _img_start = getattr(self.model, "_fastv_image_token_start", None)
-            _img_len = getattr(self.model, "_fastv_image_token_length", None)
-            if _img_start is not None and _img_len is not None and _img_len > 0:
-                _fastv_cfg = dict(_fastv_config)
-                _fastv_cfg["image_token_start_index"] = _img_start
-                _fastv_cfg["image_token_length"] = _img_len
-            else:
-                _fastv_cfg = None  # no valid range → skip pruning this step
-            outputs = self.model.fastv_forward(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                fastv_config=_fastv_cfg,
-            )
-        else:
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict
+        )
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)

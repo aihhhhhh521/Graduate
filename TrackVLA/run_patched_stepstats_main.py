@@ -145,28 +145,6 @@ def main():
     )
 
     parser.add_argument(
-        "--fastv-k",
-        type=int,
-        default=None,
-        help=(
-            "FastV pruning layer index K. "
-            "Attention is captured at layer K-1 and visual tokens are pruned at layer K. "
-            "Typical value: 3. Set to None to disable FastV."
-        ),
-    )
-
-    parser.add_argument(
-        "--fastv-r",
-        type=float,
-        default=0.5,
-        help=(
-            "FastV pruning ratio R (fraction of visual tokens to DROP). "
-            "0.5 means keep the top-50%% most-attended visual tokens. "
-            "Range: (0, 1). Default: 0.5."
-        ),
-    )
-
-    parser.add_argument(
         "opts",
         default=None,
         nargs=argparse.REMAINDER,
@@ -190,8 +168,6 @@ def run_exp(
     seed: int = None,
     token_ablation_mode: str = None,
     online_cache_prune_mode: str = "step_window",
-    fastv_k: int = None,
-    fastv_r: float = 0.5,
     opts=None,
 ) -> None:
     if run_type == "eval":
@@ -217,8 +193,6 @@ def run_exp(
                 ablation_config={
                     "token_ablation_mode": token_ablation_mode,
                     "online_cache_prune_mode": online_cache_prune_mode,
-                    "fastv_k": fastv_k,
-                    "fastv_r": fastv_r,
                 },
                 seed=effective_seed,
             )
@@ -234,8 +208,6 @@ def run_exp(
                 seed=effective_seed,
                 token_ablation_mode=token_ablation_mode,
                 online_cache_prune_mode=online_cache_prune_mode,
-                fastv_k=fastv_k,
-                fastv_r=fastv_r,
             )
         elif model_name == "baseline":
             from evt_bench.default import get_config

@@ -49,8 +49,6 @@ def evaluate_agent(
     seed: int = None,
     token_ablation_mode: str = None,
     online_cache_prune_mode: str = "step_window",
-    fastv_k: int = None,
-    fastv_r: float = 0.5,
 ) -> None:
     agent = UniNaVid_Agent(model_path, save_path)
     effective_seed = int(seed) if seed is not None else int(config.habitat.simulator.seed)
@@ -63,14 +61,6 @@ def evaluate_agent(
     if inner_model is not None and hasattr(inner_model, "config"):
         setattr(inner_model.config, "token_ablation_mode", token_ablation_mode)
         setattr(inner_model.config, "online_cache_prune_mode", online_cache_prune_mode)
-
-    # FastV: build config dict and attach to the CausalLM config so forward() can read it.
-    # fastv_k = None means FastV is disabled (baseline run).
-    if fastv_k is not None:
-        fastv_config = {"fastv_k": int(fastv_k), "fastv_r": float(fastv_r)}
-        setattr(agent.model.config, "fastv_config", fastv_config)
-    else:
-        setattr(agent.model.config, "fastv_config", None)
 
     stats_writer = None
     if enable_step_stats:
@@ -192,8 +182,8 @@ def evaluate_agent(
                                 "episode_id": env.current_episode.episode_id,
                                 "step": iter_step,
                                 "seed": effective_seed,
-                                "fastv_k": fastv_k,
-                                "fastv_r": fastv_r,
+                                "token_ablation_mode": token_ablation_mode,
+                                "online_cache_prune_mode": online_cache_prune_mode,
                                 "step_wall_ms": step_timer.ms(),
                                 "step_fps": hz_from_ms(step_timer.ms()),
                                 "vis_tokens_step": latest_vis_tokens,
