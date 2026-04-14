@@ -80,12 +80,6 @@ class FastVLlamaModel(LlamaModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        # Conservative stability guard:
-        # the current FastV path is token-pruning based and is not robust with legacy
-        # kv-cache implementations on transformers 4.35.x during generation.
-        # Disable cache when FastV is enabled to avoid CUDA index/matmul asserts.
-        if use_cache:
-            use_cache = True
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if input_ids is not None and inputs_embeds is not None:
@@ -98,7 +92,7 @@ class FastVLlamaModel(LlamaModel):
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
         if self.gradient_checkpointing and self.training and use_cache:
-            use_cache = True
+            use_cache = False
 
         past_key_values_length = 0
         use_legacy_cache = False
@@ -149,39 +143,40 @@ class FastVLlamaModel(LlamaModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if (
+            should_prune = (
                 layer_idx == fastv_k
                 and self.last_attention is not None
                 and seq_length_with_past > 1
                 and image_token_length > 0
-            ):
+            )
+            if should_prune:
                 safe_start = max(0, min(image_token_start, hidden_states.shape[1]))
                 safe_end = max(safe_start, min(image_token_start + image_token_length, hidden_states.shape[1]))
                 cur_img_len = max(0, safe_end - safe_start)
-                if cur_img_len <= 0:
-                    continue
-                keep_img = max(1, int(round(cur_img_len * (1.0 - fastv_r))))
+                if cur_img_len > 0:
+                    keep_img = max(1, int(round(cur_img_len * (1.0 - fastv_r))))
 
-                image_attention_score = self.last_attention.mean(dim=1)[0][-1][safe_start:safe_end]
-                top_idx = image_attention_score.topk(keep_img).indices + safe_start
-                keep_indices = torch.cat(
-                    (
-                        torch.arange(safe_start, device=hidden_states.device),
-                        top_idx,
-                        torch.arange(safe_end, hidden_states.shape[1], device=hidden_states.device),
-                    )
-                ).sort().values
+                    image_attention_score = self.last_attention.mean(dim=1)[0][-1][safe_start:safe_end]
+                    top_idx = image_attention_score.topk(keep_img).indices + safe_start
+                    keep_indices = torch.cat(
+                        (
+                            torch.arange(safe_start, device=hidden_states.device),
+                            top_idx,
+                            torch.arange(safe_end, hidden_states.shape[1], device=hidden_states.device),
+                        )
+                    ).sort().values
 
-                hidden_states = hidden_states[:, keep_indices, :]
-                # Use contiguous positions after pruning for compatibility with older
-                # transformers/rotary cache implementations.
-                position_ids = torch.arange(
-                    hidden_states.shape[1], dtype=torch.long, device=hidden_states.device
-                ).unsqueeze(0)
-                if causal_or_padding_mask is not None and causal_or_padding_mask.ndim == 4:
-                    causal_or_padding_mask = causal_or_padding_mask[
-                        :, :, : hidden_states.shape[1], : hidden_states.shape[1]
-                    ]
+                    hidden_states = hidden_states[:, keep_indices, :]
+                    # Keep original token positions after pruning (official FastV behavior).
+                    position_ids = keep_indices.unsqueeze(0)
+                    if causal_or_padding_mask is not None:
+                        causal_or_padding_mask = self._build_4d_causal_mask(
+                            None,
+                            batch_size,
+                            hidden_states.shape[1],
+                            hidden_states,
+                            0,
+                        )
 
             effective_output_attentions = layer_idx == (fastv_k - 1)
             layer_outputs = decoder_layer(
