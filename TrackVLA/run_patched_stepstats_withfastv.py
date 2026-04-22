@@ -166,52 +166,6 @@ def main():
         ),
     )
 
-    # ------------------------------------------------------------------
-    # In-Place TTT (ported from ByteDance-Seed/In-Place-TTT).
-    # All defaults keep TTT disabled so runs without --ttt-mode behave like
-    # the original Uni-NaVid pipeline.
-    # ------------------------------------------------------------------
-    parser.add_argument(
-        "--ttt-mode",
-        action="store_true",
-        help="Enable In-Place TTT (fast-weight update of MLP.down_proj at "
-             "inference). When absent, TTT is fully bypassed.",
-    )
-    parser.add_argument(
-        "--ttt-layers",
-        type=str,
-        default="0,6,12,18,24,30",
-        help="Comma-separated decoder-layer indices to insert TTT at. "
-             "Official LLaMA-3.1-8B recommendation: 0,6,12,18,24,30 (stride 6).",
-    )
-    parser.add_argument(
-        "--ttt-lr",
-        type=float,
-        default=0.3,
-        help="Fast-weight update step size for TTT (official inference default 0.3).",
-    )
-    parser.add_argument(
-        "--ttt-chunk",
-        type=int,
-        default=8192,
-        help="Chunk size for chunk-wise TTT updates. When prefill length < chunk, "
-             "the MLP bypasses the update and only reads the carried weight.",
-    )
-    parser.add_argument(
-        "--ttt-no-proj",
-        action="store_true",
-        help="Disable the TTT projection A_omega (ttt_proj). Default: enabled "
-             "(matches official config ttt_proj=true).",
-    )
-    parser.add_argument(
-        "--ttt-target",
-        type=str,
-        default="hidden_states",
-        choices=["hidden_states", "input_embed"],
-        help="Target states for the TTT objective. Use 'hidden_states' for "
-             "continual-trained checkpoints; 'input_embed' is for from-scratch.",
-    )
-
     parser.add_argument(
         "opts",
         default=None,
@@ -238,12 +192,6 @@ def run_exp(
     online_cache_prune_mode: str = "step_window",
     fastv_k: int = None,
     fastv_r: float = 0.5,
-    ttt_mode: bool = False,
-    ttt_layers: str = "0,6,12,18,24,30",
-    ttt_lr: float = 0.3,
-    ttt_chunk: int = 8192,
-    ttt_no_proj: bool = False,
-    ttt_target: str = "hidden_states",
     opts=None,
 ) -> None:
     if run_type == "eval":
@@ -261,12 +209,6 @@ def run_exp(
             )
             dataset_split = dataset.get_splits(split_num)[split_id]
 
-            # Parse ttt_layers comma string to list[int] once here.
-            try:
-                ttt_layers_list = [int(s) for s in str(ttt_layers).split(",") if s.strip() != ""]
-            except Exception:
-                raise ValueError(f"--ttt-layers must be a comma list of ints, got: {ttt_layers!r}")
-
             write_run_meta(
                 save_path=save_path,
                 model_path=model_path,
@@ -277,12 +219,6 @@ def run_exp(
                     "online_cache_prune_mode": online_cache_prune_mode,
                     "fastv_k": fastv_k,
                     "fastv_r": fastv_r,
-                    "ttt_mode": ttt_mode,
-                    "ttt_layers": ttt_layers_list,
-                    "ttt_lr": ttt_lr,
-                    "ttt_chunk": ttt_chunk,
-                    "ttt_proj": (not ttt_no_proj),
-                    "ttt_target": ttt_target,
                 },
                 seed=effective_seed,
             )
@@ -300,12 +236,6 @@ def run_exp(
                 online_cache_prune_mode=online_cache_prune_mode,
                 fastv_k=fastv_k,
                 fastv_r=fastv_r,
-                ttt_mode=ttt_mode,
-                ttt_layers=ttt_layers_list,
-                ttt_lr=ttt_lr,
-                ttt_chunk=ttt_chunk,
-                ttt_proj=(not ttt_no_proj),
-                ttt_target=ttt_target,
             )
         elif model_name == "baseline":
             from evt_bench.default import get_config

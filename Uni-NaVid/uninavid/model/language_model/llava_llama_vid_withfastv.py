@@ -27,7 +27,6 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from uninavid.model.uninavid_arch import UniNaVIDMetaModel, UniNaVIDMetaForCausalLM
 from uninavid.constants import NAVIGATION_IDENTIFIER
 from .fastv_llama import FastVLlamaModel
-from .ttt_llama import install_ttt_layers, reset_ttt_states
 
 import os
 print("Setting WANDB_MODE to offline")
@@ -37,22 +36,11 @@ os.environ["WANDB_MODE"] = "offline"
 class LlavaConfig(LlamaConfig):
     model_type = "llava"
 
-    # In-Place TTT configuration (verbatim field names from In-Place-TTT official).
-    # All default values keep TTT OFF, so unmodified runs behave exactly like origin.
-    ttt_mode: bool = False
-    ttt_layers: list = []
-    ttt_proj: bool = True
-    ttt_lr: float = 0.3
-    ttt_chunk: int = 8192
-    ttt_target: str = "hidden_states"
-
 class LlavaAttLlamaModel(UniNaVIDMetaModel, FastVLlamaModel):
     config_class = LlavaConfig
 
     def __init__(self, config: LlamaConfig):
         super(LlavaAttLlamaModel, self).__init__(config)
-        # Conservative TTT install: no-op when config.ttt_mode is False.
-        install_ttt_layers(self)
 
 class LlavaLlamaAttForCausalLM(LlamaForCausalLM, UniNaVIDMetaForCausalLM):
     config_class = LlavaConfig
@@ -102,12 +90,6 @@ class LlavaLlamaAttForCausalLM(LlamaForCausalLM, UniNaVIDMetaForCausalLM):
         # regular LlamaModel forward path.
         _fastv_config = getattr(self.config, "fastv_config", None)
         _is_prefill = not past_key_values
-
-        # TTT: reset per-layer side-car state at the start of each generate()
-        # call (prefill). Decode steps keep the accumulated state so chunk-wise
-        # fast-weight updates stay consistent across tokens.
-        if _is_prefill and bool(getattr(self.config, "ttt_mode", False)):
-            reset_ttt_states(self.model)
         if _fastv_config is not None and _is_prefill:
             _img_start = getattr(self.model, "_fastv_image_token_start", None)
             _img_len = getattr(self.model, "_fastv_image_token_length", None)

@@ -1,14 +1,7 @@
 CHUNKS=30
 NUM_PARALLEL=8
-SAVE_PATH="exp_results/uninavid_ttt/at1"
+SAVE_PATH="exp_results/uninavid_all/at1"
 MODEL_PATH="model_zoo/llama-vid-7b-full-224-video-fps-1-grid-2-panda-encoder-2025-10-10-all-data"
-
-# Notes on flag semantics (matches TrackVLA_origin/eval_uninavid.sh inference):
-#   * FastV is intentionally NOT passed (fastv_k defaults to None -> FastV disabled).
-#   * --online-cache-prune-mode off: keep per-episode feat_cache accumulation like
-#     Uni-NaVid_origin; step_window would trim the cache every step.
-#   * --token-ablation-mode is NOT passed (defaults to None -> no ablation).
-#   * --ttt-* enables In-Place TTT on the LLM backbone (LLaMA-2-7B, 32 layers).
 
 IDX=0
 while [ $IDX -lt $CHUNKS ]; do
@@ -24,12 +17,8 @@ while [ $IDX -lt $CHUNKS ]; do
             --model-name 'uni-navid' \
             --enable-step-stats \
             --log-every-n-steps 1 \
-            --online-cache-prune-mode off \
-            --ttt-mode \
-            --ttt-layers 0,6,12,18,24,30 \
-            --ttt-lr 0.3 \
-            --ttt-chunk 8192 \
-            --ttt-target hidden_states &
+            --fastv-k 3 \
+            --fastv-r 0.5 &
         ((IDX++))
     done
     wait

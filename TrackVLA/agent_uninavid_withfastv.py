@@ -51,26 +51,8 @@ def evaluate_agent(
     online_cache_prune_mode: str = "step_window",
     fastv_k: int = None,
     fastv_r: float = 0.5,
-    ttt_mode: bool = False,
-    ttt_layers=None,
-    ttt_lr: float = 0.3,
-    ttt_chunk: int = 8192,
-    ttt_proj: bool = True,
-    ttt_target: str = "hidden_states",
 ) -> None:
-    # Pass TTT config into UniNaVid_Agent so it can (a) attach the flags onto the
-    # HF config after from_pretrained and (b) call install_ttt_layers() to swap
-    # the chosen decoder layers with TTT-aware ones.
-    agent = UniNaVid_Agent(
-        model_path,
-        save_path,
-        ttt_mode=ttt_mode,
-        ttt_layers=(ttt_layers if ttt_layers is not None else []),
-        ttt_lr=ttt_lr,
-        ttt_chunk=ttt_chunk,
-        ttt_proj=ttt_proj,
-        ttt_target=ttt_target,
-    )
+    agent = UniNaVid_Agent(model_path, save_path)
     effective_seed = int(seed) if seed is not None else int(config.habitat.simulator.seed)
     _set_global_seed(effective_seed)
 
@@ -212,7 +194,6 @@ def evaluate_agent(
                                 "seed": effective_seed,
                                 "fastv_k": fastv_k,
                                 "fastv_r": fastv_r,
-                                "ttt_mode": bool(getattr(agent.model.config, "ttt_mode", False)),
                                 "step_wall_ms": step_timer.ms(),
                                 "step_fps": hz_from_ms(step_timer.ms()),
                                 "vis_tokens_step": latest_vis_tokens,
@@ -260,18 +241,7 @@ def evaluate_agent(
 
 
 class UniNaVid_Agent(Agent):
-    def __init__(
-        self,
-        model_path,
-        result_path,
-        exp_save='video',
-        ttt_mode: bool = False,
-        ttt_layers=None,
-        ttt_lr: float = 0.3,
-        ttt_chunk: int = 8192,
-        ttt_proj: bool = True,
-        ttt_target: str = "hidden_states",
-    ):
+    def __init__(self, model_path, result_path, exp_save='video'):
         print("Initialize UniNaVid")
 
         self.result_path = result_path
@@ -284,29 +254,6 @@ class UniNaVid_Agent(Agent):
 
         self.model_name = get_model_name_from_path(model_path)
         self.tokenizer, self.model, self.image_processor, self.context_len = load_pretrained_model(model_path, None, get_model_name_from_path(model_path))
-
-        # Enable TTT AFTER the base model is loaded from disk. We stamp the
-        # TTT flags onto both wrapper and inner configs, then (re)run the
-        # official install helper to swap the chosen decoder layers with
-        # TTT-aware ones. This keeps the on-disk checkpoint config untouched.
-        if bool(ttt_mode):
-            from uninavid.model.language_model.ttt_llama import install_ttt_layers
-
-            ttt_layers_list = list(ttt_layers) if ttt_layers is not None else []
-            inner = self.model.get_model() if hasattr(self.model, "get_model") else None
-            for _cfg in [self.model.config, getattr(inner, "config", None)]:
-                if _cfg is None:
-                    continue
-                _cfg.ttt_mode = True
-                _cfg.ttt_layers = ttt_layers_list
-                _cfg.ttt_lr = float(ttt_lr)
-                _cfg.ttt_chunk = int(ttt_chunk)
-                _cfg.ttt_proj = bool(ttt_proj)
-                _cfg.ttt_target = str(ttt_target)
-            if inner is not None:
-                install_ttt_layers(inner)
-            print(f"[TTT] Enabled: layers={ttt_layers_list}, lr={ttt_lr}, "
-                  f"chunk={ttt_chunk}, proj={ttt_proj}, target={ttt_target}")
 
         print("Initialization Complete")
 
