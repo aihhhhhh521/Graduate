@@ -73,7 +73,7 @@ class TTTLlamaMLP(nn.Module):
         self.is_ttt = bool(getattr(config, "ttt_mode", False)) and (self.layer_idx in ttt_layers)
 
         if self.is_ttt:
-            self.ttt_chunk = int(getattr(config, "ttt_chunk", 8192))
+            self.ttt_chunk = int(getattr(config, "ttt_chunk", 1024))
             self.ttt_lr = float(getattr(config, "ttt_lr", 0.3))
             if bool(getattr(config, "ttt_proj", True)):
                 self.ttt_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
@@ -148,7 +148,7 @@ class TTTLlamaDecoderLayer(LlamaDecoderLayer):
     def __init__(self, config, layer_idx: int):
         super().__init__(config)
         self.layer_idx = layer_idx
-        self.ttt_chunk = int(getattr(config, "ttt_chunk", 8192))
+        self.ttt_chunk = int(getattr(config, "ttt_chunk", 1024))
         ttt_layers = getattr(config, "ttt_layers", []) or []
         self.is_ttt = bool(getattr(config, "ttt_mode", False)) and (layer_idx in ttt_layers)
         self.ttt_target = str(getattr(config, "ttt_target", "hidden_states"))

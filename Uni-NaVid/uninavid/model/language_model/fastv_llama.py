@@ -1,19 +1,8 @@
 from typing import List, Optional, Tuple, Union
 
-import os
 import torch
-import torch.nn as nn
-from torch.nn import CrossEntropyLoss
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    LlamaConfig,
-    LlamaForCausalLM,
-)
 from transformers.models.llama.modeling_llama import LlamaModel
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
-
-from uninavid.model.uninavid_arch import UniNaVIDMetaModel, UniNaVIDMetaForCausalLM
+from transformers.modeling_outputs import BaseModelOutputWithPast
 
 try:
     from transformers.models.llama.modeling_llama import _prepare_4d_causal_attention_mask
@@ -80,6 +69,12 @@ class FastVLlamaModel(LlamaModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
+        # Conservative stability guard:
+        # the current FastV path is token-pruning based and is not robust with legacy
+        # kv-cache implementations on transformers 4.35.x during generation.
+        # Disable cache when FastV is enabled to avoid CUDA index/matmul asserts.
+        if use_cache:
+            use_cache = True
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if input_ids is not None and inputs_embeds is not None:
@@ -92,7 +87,7 @@ class FastVLlamaModel(LlamaModel):
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
         if self.gradient_checkpointing and self.training and use_cache:
-            use_cache = False
+            use_cache = True
 
         past_key_values_length = 0
         use_legacy_cache = False
@@ -143,40 +138,39 @@ class FastVLlamaModel(LlamaModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            should_prune = (
+            if (
                 layer_idx == fastv_k
                 and self.last_attention is not None
                 and seq_length_with_past > 1
                 and image_token_length > 0
-            )
-            if should_prune:
+            ):
                 safe_start = max(0, min(image_token_start, hidden_states.shape[1]))
                 safe_end = max(safe_start, min(image_token_start + image_token_length, hidden_states.shape[1]))
                 cur_img_len = max(0, safe_end - safe_start)
-                if cur_img_len > 0:
-                    keep_img = max(1, int(round(cur_img_len * (1.0 - fastv_r))))
+                if cur_img_len <= 0:
+                    continue
+                keep_img = max(1, int(round(cur_img_len * (1.0 - fastv_r))))
 
-                    image_attention_score = self.last_attention.mean(dim=1)[0][-1][safe_start:safe_end]
-                    top_idx = image_attention_score.topk(keep_img).indices + safe_start
-                    keep_indices = torch.cat(
-                        (
-                            torch.arange(safe_start, device=hidden_states.device),
-                            top_idx,
-                            torch.arange(safe_end, hidden_states.shape[1], device=hidden_states.device),
-                        )
-                    ).sort().values
+                image_attention_score = self.last_attention.mean(dim=1)[0][-1][safe_start:safe_end]
+                top_idx = image_attention_score.topk(keep_img).indices + safe_start
+                keep_indices = torch.cat(
+                    (
+                        torch.arange(safe_start, device=hidden_states.device),
+                        top_idx,
+                        torch.arange(safe_end, hidden_states.shape[1], device=hidden_states.device),
+                    )
+                ).sort().values
 
-                    hidden_states = hidden_states[:, keep_indices, :]
-                    # Keep original token positions after pruning (official FastV behavior).
-                    position_ids = keep_indices.unsqueeze(0)
-                    if causal_or_padding_mask is not None:
-                        causal_or_padding_mask = self._build_4d_causal_mask(
-                            None,
-                            batch_size,
-                            hidden_states.shape[1],
-                            hidden_states,
-                            0,
-                        )
+                hidden_states = hidden_states[:, keep_indices, :]
+                # Use contiguous positions after pruning for compatibility with older
+                # transformers/rotary cache implementations.
+                position_ids = torch.arange(
+                    hidden_states.shape[1], dtype=torch.long, device=hidden_states.device
+                ).unsqueeze(0)
+                if causal_or_padding_mask is not None and causal_or_padding_mask.ndim == 4:
+                    causal_or_padding_mask = causal_or_padding_mask[
+                        :, :, : hidden_states.shape[1], : hidden_states.shape[1]
+                    ]
 
             effective_output_attentions = layer_idx == (fastv_k - 1)
             layer_outputs = decoder_layer(
@@ -235,127 +229,3 @@ class FastVLlamaModel(LlamaModel):
                 expanded = (1.0 - attention_mask[:, None, None, :].to(dtype)) * torch.finfo(dtype).min
                 causal = causal + expanded
         return causal
-
-
-print("Setting WANDB_MODE to offline")
-os.environ["WANDB_MODE"] = "offline"
-
-
-class LlavaFastVConfig(LlamaConfig):
-    model_type = "llava_fastv"
-
-
-class LlavaAttFastVLlamaModel(UniNaVIDMetaModel, FastVLlamaModel):
-    config_class = LlavaFastVConfig
-
-    def __init__(self, config: LlamaConfig):
-        super(LlavaAttFastVLlamaModel, self).__init__(config)
-
-
-class LlavaLlamaAttFastVForCausalLM(LlamaForCausalLM, UniNaVIDMetaForCausalLM):
-    config_class = LlavaFastVConfig
-
-    def __init__(self, config):
-        super(LlamaForCausalLM, self).__init__(config)
-        self.model = LlavaAttFastVLlamaModel(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.post_init()
-
-    def get_model(self):
-        return self.model
-
-    def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        images: Optional[torch.FloatTensor] = None,
-        prompts: Optional[List[str]] = None,
-        return_dict: Optional[bool] = None,
-        fastv_config: Optional[dict] = None,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        if not self.training:
-            if images[0].device != self.device:
-                images[0] = images[0].to(device=self.device)
-            if input_ids.device != self.device:
-                input_ids = input_ids.to(device=self.device)
-
-        input_ids, attention_mask, past_key_values, inputs_embeds, labels = self.prepare_inputs_labels_for_multimodal(
-            input_ids, attention_mask, past_key_values, labels, images, prompts=prompts
-        )
-
-        torch.cuda.empty_cache()
-
-        outputs = self.model.fastv_forward(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            fastv_config=fastv_config,
-        )
-
-        hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
-
-        loss = None
-        if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
-
-        if not return_dict:
-            output = (logits,) + outputs[1:]
-            return (loss,) + output if loss is not None else output
-
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
-
-    def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
-    ):
-        if past_key_values:
-            input_ids = input_ids[:, -1:]
-
-        if inputs_embeds is not None and past_key_values is None:
-            model_inputs = {"inputs_embeds": inputs_embeds}
-        else:
-            model_inputs = {"input_ids": input_ids}
-
-        model_inputs.update(
-            {
-                "past_key_values": past_key_values,
-                "use_cache": kwargs.get("use_cache"),
-                "attention_mask": attention_mask,
-                "images": kwargs.get("images", None),
-                "fastv_config": kwargs.get("fastv_config", None),
-            }
-        )
-        return model_inputs
-
-
-AutoConfig.register("llava_fastv", LlavaFastVConfig)
-AutoModelForCausalLM.register(LlavaFastVConfig, LlavaLlamaAttFastVForCausalLM)

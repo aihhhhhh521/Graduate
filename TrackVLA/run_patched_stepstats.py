@@ -193,7 +193,7 @@ def main():
     parser.add_argument(
         "--ttt-chunk",
         type=int,
-        default=8192,
+        default=512,
         help="Chunk size for chunk-wise TTT updates. When prefill length < chunk, "
              "the MLP bypasses the update and only reads the carried weight.",
     )
@@ -241,7 +241,7 @@ def run_exp(
     ttt_mode: bool = False,
     ttt_layers: str = "0,6,12,18,24,30",
     ttt_lr: float = 0.3,
-    ttt_chunk: int = 8192,
+    ttt_chunk: int = 1024,
     ttt_no_proj: bool = False,
     ttt_target: str = "hidden_states",
     opts=None,

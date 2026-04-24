@@ -197,10 +197,10 @@ class UniNaVIDMetaForCausalLM(ABC):
             structure_lines.append(f"├─ VIDEO_HIST × {int(blk)}")
         structure_lines.extend(
             [
-                f"├─ VIDEO_NAV × {nav_tokens}",
+                f"|-- VIDEO_NAV x {nav_tokens}",
                 "<|vision_eos|>",
                 "<|text_semantic|>",
-                f"├─ TEXT × {text_tokens}",
+                f"|-- TEXT x {text_tokens}",
                 "<|text_eos|>",
             ]
         )
@@ -355,11 +355,6 @@ class UniNaVIDMetaForCausalLM(ABC):
         # episode_end/off: keep full episode cache and only clear at reset.
         if cache_prune_mode == "step_window":
             self.get_model().feat_cache = self.get_model().feat_cache[k - length_threshold:]
-            long_cache_cap = int(getattr(self.config, "online_long_cache_cap", length_threshold))
-            if long_cache_cap > 0 and self.get_model().long_feat_cache is not None:
-                long_cache = self.get_model().long_feat_cache
-                if long_cache.shape[0] > long_cache_cap:
-                    self.get_model().long_feat_cache = long_cache[-long_cache_cap:]
         elif cache_prune_mode in ("episode_end", "off"):
             pass
         else:
@@ -459,7 +454,7 @@ class UniNaVIDMetaForCausalLM(ABC):
         compress_type = self.config.compress_type
         online_length_threshold = getattr(self.config, "online_length_threshold", 64)
         online_similarity_threshold = getattr(self.config, "online_similarity_threshold", 0.985)
-        compress_grid_sizes = {"grid:2": 16, "grid:4": 16, "mean": 1}
+        compress_grid_sizes = {"grid:2": 4, "grid:4": 16, "mean": 1}
 
         nav_size = compress_grid_sizes.get(compress_type)
         if nav_size is None:
@@ -620,12 +615,11 @@ class UniNaVIDMetaForCausalLM(ABC):
             # nav query uses only the current frame (last)
             vis_embed_nav = process_grid(vis_embed[-1:], 8)
 
-            # For short-term history tokens, keep a denser 4x4 grid when compress_type=grid:2.
-            history_grid_size = 4 if grid_size == 2 else grid_size
-            if history_grid_size is None:
+            # history/current sequence for cache
+            if grid_size is None:
                 vis_embed = process_mean(vis_embed)
             else:
-                vis_embed = process_grid(vis_embed, history_grid_size)
+                vis_embed = process_grid(vis_embed, grid_size)
 
         # 3) Pure video QA: compress the whole sequence
         else:
@@ -655,7 +649,7 @@ class UniNaVIDMetaForCausalLM(ABC):
         if 'grid' in self.config.compress_type:
             grid_size = int(self.config.compress_type.split('grid:')[-1])
             if grid_size == 2:
-                nav_size = 16
+                nav_size = 4
             elif grid_size == 4:
                 nav_size = 16
             else:
@@ -713,6 +707,7 @@ class UniNaVIDMetaForCausalLM(ABC):
                 continue
 
             image_token_indices = torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0]
+            first_image_token_start = int(image_token_indices[0].item()) if image_token_indices.numel() > 0 else 0
             cur_new_input_embeds = []
             if labels is not None:
                 cur_labels = labels[batch_idx]
@@ -720,16 +715,13 @@ class UniNaVIDMetaForCausalLM(ABC):
                 assert cur_labels.shape == cur_input_ids.shape
 
             if not long_video:
-                token_idx = 0
-                _fastv_first_image_token_start = None  # position of first visual token in the embedding seq
+                token_idx = 0  
                 while image_token_indices.numel() > 0:
                     if isinstance(image_features, list):
                         cur_image_features = image_features[cur_image_idx][token_idx]
                     else:
                         cur_image_features = image_features[cur_image_idx]
                     image_token_start = image_token_indices[0]
-                    if _fastv_first_image_token_start is None:
-                        _fastv_first_image_token_start = int(image_token_start)
 
                     if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config,
                                                                                       'mm_use_im_start_end', False):
@@ -832,9 +824,6 @@ class UniNaVIDMetaForCausalLM(ABC):
                     image_token_indices = torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0]
                     token_idx += 1
 
-                # FastV: capture remaining text-suffix length before appending it
-                _fastv_text_suffix = int(cur_input_ids.numel())
-
                 # changle image idx after processing one sample
                 cur_image_idx += 1
                 if cur_input_ids.numel() > 0:
@@ -848,19 +837,25 @@ class UniNaVIDMetaForCausalLM(ABC):
                 cur_new_input_embeds = [x.to(device=self.device) for x in cur_new_input_embeds]
                 cur_new_input_embeds = torch.cat(cur_new_input_embeds, dim=0)
 
-                # FastV: store (start, length) of the visual-token span so the
-                # LLM forward pass can pass them into fastv_forward.
-                if _fastv_first_image_token_start is not None:
-                    _fastv_vis_len = (
-                            int(cur_new_input_embeds.shape[0])
-                            - _fastv_first_image_token_start
-                            - _fastv_text_suffix
-                    )
-                    self.get_model()._fastv_image_token_start = _fastv_first_image_token_start
-                    self.get_model()._fastv_image_token_length = max(0, _fastv_vis_len)
-
                 if hasattr(self, "_attach_llm_input_token_structure"):
                     self._attach_llm_input_token_structure(int(cur_new_input_embeds.shape[0]))
+                    
+                if bool(getattr(self.config, "fastv_enable", False)):
+                    runtime_stats = {}
+                    if hasattr(self, "get_runtime_stats"):
+                        try:
+                            runtime_stats = self.get_runtime_stats() or {}
+                        except Exception:
+                            runtime_stats = {}
+                    vis_len = 64
+                    if runtime_stats.get("vis_tokens_llm_steps"):
+                        vis_len = int(runtime_stats["vis_tokens_llm_steps"][-1])
+                    self.config.fastv_config = {
+                        "fastv_k": int(getattr(self.config, "fastv_k", 3)),
+                        "fastv_r": float(getattr(self.config, "fastv_r", 0.5)),
+                        "image_token_start_index": int(first_image_token_start),
+                        "image_token_length": int(vis_len),
+                    }
 
                 new_input_embeds.append(cur_new_input_embeds)
                 if labels is not None:

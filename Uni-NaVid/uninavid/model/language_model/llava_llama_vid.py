@@ -26,7 +26,11 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from uninavid.model.uninavid_arch import UniNaVIDMetaModel, UniNaVIDMetaForCausalLM
 from uninavid.constants import NAVIGATION_IDENTIFIER
-from .fastv_llama import FastVLlamaModel
+
+# TTT-only hooks. FastV is intentionally NOT imported here so the two
+# experiments stay strictly isolated: the model class hierarchy, forward
+# dispatch, and config defaults below are identical to the Uni-NaVid_origin
+# baseline unless --ttt-mode is explicitly turned on.
 from .ttt_llama import install_ttt_layers, reset_ttt_states
 
 import os
@@ -37,22 +41,25 @@ os.environ["WANDB_MODE"] = "offline"
 class LlavaConfig(LlamaConfig):
     model_type = "llava"
 
-    # In-Place TTT configuration (verbatim field names from In-Place-TTT official).
-    # All default values keep TTT OFF, so unmodified runs behave exactly like origin.
+    # In-Place TTT configuration (field names verbatim from In-Place-TTT official).
+    # All defaults keep TTT OFF, so unmodified runs behave exactly like origin.
     ttt_mode: bool = False
     ttt_layers: list = []
     ttt_proj: bool = True
     ttt_lr: float = 0.3
-    ttt_chunk: int = 8192
+    ttt_chunk: int = 1024
     ttt_target: str = "hidden_states"
 
-class LlavaAttLlamaModel(UniNaVIDMetaModel, FastVLlamaModel):
+
+class LlavaAttLlamaModel(UniNaVIDMetaModel, LlamaModel):
     config_class = LlavaConfig
 
     def __init__(self, config: LlamaConfig):
         super(LlavaAttLlamaModel, self).__init__(config)
-        # Conservative TTT install: no-op when config.ttt_mode is False.
+        # TTT install is a no-op when config.ttt_mode is False; when turned on
+        # it swaps only the decoder layers listed in config.ttt_layers.
         install_ttt_layers(self)
+
 
 class LlavaLlamaAttForCausalLM(LlamaForCausalLM, UniNaVIDMetaForCausalLM):
     config_class = LlavaConfig
@@ -97,48 +104,22 @@ class LlavaLlamaAttForCausalLM(LlamaForCausalLM, UniNaVIDMetaForCausalLM):
 
         torch.cuda.empty_cache()
 
-        # FastV: only apply on the prefill pass (past_key_values is None / empty).
-        # On decode steps past_key_values is populated so we fall through to the
-        # regular LlamaModel forward path.
-        _fastv_config = getattr(self.config, "fastv_config", None)
-        _is_prefill = not past_key_values
-
         # TTT: reset per-layer side-car state at the start of each generate()
-        # call (prefill). Decode steps keep the accumulated state so chunk-wise
-        # fast-weight updates stay consistent across tokens.
-        if _is_prefill and bool(getattr(self.config, "ttt_mode", False)):
+        # call (prefill step, past_key_values is empty). Gated strictly on
+        # ttt_mode so a non-TTT run takes the exact same path as origin.
+        if bool(getattr(self.config, "ttt_mode", False)) and not past_key_values:
             reset_ttt_states(self.model)
-        if _fastv_config is not None and _is_prefill:
-            _img_start = getattr(self.model, "_fastv_image_token_start", None)
-            _img_len = getattr(self.model, "_fastv_image_token_length", None)
-            if _img_start is not None and _img_len is not None and _img_len > 0:
-                _fastv_cfg = dict(_fastv_config)
-                _fastv_cfg["image_token_start_index"] = _img_start
-                _fastv_cfg["image_token_length"] = _img_len
-            else:
-                _fastv_cfg = None  # no valid range → skip pruning this step
-            outputs = self.model.fastv_forward(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                fastv_config=_fastv_cfg,
-            )
-        else:
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict
+        )
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)

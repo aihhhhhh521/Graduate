@@ -54,7 +54,7 @@ def evaluate_agent(
     ttt_mode: bool = False,
     ttt_layers=None,
     ttt_lr: float = 0.3,
-    ttt_chunk: int = 8192,
+    ttt_chunk: int = 1024,
     ttt_proj: bool = True,
     ttt_target: str = "hidden_states",
 ) -> None:
@@ -268,7 +268,7 @@ class UniNaVid_Agent(Agent):
         ttt_mode: bool = False,
         ttt_layers=None,
         ttt_lr: float = 0.3,
-        ttt_chunk: int = 8192,
+        ttt_chunk: int = 1024,
         ttt_proj: bool = True,
         ttt_target: str = "hidden_states",
     ):
@@ -382,7 +382,7 @@ class UniNaVid_Agent(Agent):
         imgs = self.process_images(self.rgb_list)
         self.rgb_list = []
 
-        cur_prompt = f"{NAVIGATION_SPECIAL_TOKEN} {question}"
+        cur_prompt = question
         with torch.inference_mode():
             self.model.update_prompt([[cur_prompt]])
             output_ids = self.model.generate(
