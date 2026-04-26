@@ -94,8 +94,9 @@ def parse_args() -> argparse.Namespace:
     # Oracle teacher thresholds.
     p.add_argument("--follow-radius", type=float, default=1.5,
                    help="Within this XZ-distance from the main human, oracle emits 'stop'.")
-    p.add_argument("--angle-thresh", type=float, default=0.3,
-                   help="If |bearing| (rad) <= thresh, oracle emits 'forward'; otherwise 'left'/'right'.")
+    p.add_argument("--angle-thresh", type=float, default=0.4,
+                   help="If |bearing| (rad) <= thresh, oracle emits 'forward'; otherwise 'left'/'right'. "
+                        "Default ~23 deg keeps the robot from oscillating when the human is mid-turn.")
 
     # Output layout.
     p.add_argument("--video-subdir", default="track_videos",
@@ -218,16 +219,40 @@ def _to_xyz(v) -> np.ndarray:
     return arr[:3]
 
 
-def _oracle_action(sim, robot_pos: np.ndarray, robot_yaw: float,
+def _robot_forward_xz(robot) -> tuple:
+    """
+    Return the robot's world-frame forward direction projected to XZ as (fx, fz).
+
+    Why not robot.base_rot? In habitat-lab/.../articulated_agent_base.py:170
+    `base_rot` is implemented as `self.sim_obj.rotation.angle()`, which is the
+    UNSIGNED magnitude of the quaternion rotation -- it cannot tell facing
+    direction (yaw=-30 deg and yaw=+30 deg both come back as +30 deg). Using it
+    to build a forward vector is what made the robot rock left/right in place.
+
+    Agent local forward in habitat-sim is -Z. We transform that local axis by
+    the agent's full base_transformation (rotation part) to get the true world
+    forward, regardless of yaw sign.
+    """
+    try:
+        import magnum as mn
+        fwd_local = mn.Vector3(0.0, 0.0, -1.0)
+        fwd_world = robot.base_transformation.transform_vector(fwd_local)
+        return float(fwd_world.x), float(fwd_world.z)
+    except Exception:
+        # Last-resort fallback (works only if base_rot happens to be signed).
+        yaw = float(robot.base_rot)
+        return math.sin(yaw), -math.cos(yaw)
+
+
+def _oracle_action(sim, robot_pos: np.ndarray, fx: float, fz: float,
                    human_pos: np.ndarray, follow_radius: float,
                    angle_thresh: float) -> str:
     """
-    Discrete action from the next shortest-path waypoint.
+    Discrete action from the next shortest-path waypoint toward the human.
 
-    Habitat convention: y-up; agent yaw=0 -> forward = -Z. Forward unit vector:
-        f = (sin(yaw), 0, -cos(yaw))
-    Bearing of waypoint relative to forward, signed (>0 = waypoint is to the LEFT
-    of the robot under the right-hand rule about +Y).
+    Bearing convention (right-hand rule, +Y up):
+        cross_y = fz*dx - fx*dz  > 0  =>  waypoint is to robot's LEFT
+                                     < 0  =>  waypoint is to robot's RIGHT
     """
     rx, _, rz = float(robot_pos[0]), float(robot_pos[1]), float(robot_pos[2])
     hx, _, hz = float(human_pos[0]), float(human_pos[1]), float(human_pos[2])
@@ -250,14 +275,14 @@ def _oracle_action(sim, robot_pos: np.ndarray, robot_yaw: float,
         pass
 
     dx, dz = wx - rx, wz - rz
-    if dx == 0.0 and dz == 0.0:
+    if abs(dx) < 1e-6 and abs(dz) < 1e-6:
         return "stop"
 
-    fx, fz = math.sin(robot_yaw), -math.cos(robot_yaw)
     n = math.hypot(dx, dz)
-    cos_b = (fx * dx + fz * dz) / (n + 1e-9)
-    cross_y = fz * dx - fx * dz   # >0 when waypoint is to the LEFT
-    bearing = math.atan2(cross_y, cos_b)
+    fn = math.hypot(fx, fz) + 1e-9
+    cos_b = (fx * dx + fz * dz) / (n * fn + 1e-9)
+    cross_y = fz * dx - fx * dz
+    bearing = math.atan2(cross_y, cos_b)   # signed, in (-pi, pi]
 
     if abs(bearing) < angle_thresh:
         return "forward"
@@ -339,9 +364,9 @@ def _collect(args, config, dataset) -> int:
 
                     robot_pos = _to_xyz(robot.base_pos)
                     human_pos = _to_xyz(humanoid_main.base_pos)
-                    yaw = float(robot.base_rot)
+                    fx, fz = _robot_forward_xz(robot)
                     token = _oracle_action(
-                        sim, robot_pos, yaw, human_pos,
+                        sim, robot_pos, fx, fz, human_pos,
                         args.follow_radius, args.angle_thresh,
                     )
                     tokens.append(token)
