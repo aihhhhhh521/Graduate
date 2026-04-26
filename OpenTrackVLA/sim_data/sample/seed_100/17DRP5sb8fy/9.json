@@ -1,0 +1,10 @@
+{
+  "finish": true,
+  "status": "Normal",
+  "success": 1.0,
+  "following_rate": 0.47619047619047616,
+  "following_step": 40,
+  "total_step": 84,
+  "collision": 0.0,
+  "instruction": "Follow the person wearing a brown armored outfit and green sleeves."
+}
